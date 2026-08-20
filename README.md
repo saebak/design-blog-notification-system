@@ -44,8 +44,8 @@ docker compose up -d
 - [도메인 설계](./docs/domain-design.md) — Post / Subscription / Notification Bounded Context 및 Context Map
 - [데이터베이스 설계](./docs/database-design.md) — Context별 DDL 및 인덱스 전략
 - [아키텍처 설계](./docs/architecture.md) — 메시지 브로커/2단계 Fan-out/Delivery 파이프라인/실시간 채널
-- 부하 테스트 리포트 (예정) — `docs/load-test-report.md`
-- 장애 주입(Chaos) 테스트 리포트 (예정) — `docs/chaos-test-report.md`
+- [부하 테스트 시나리오 설계](./docs/test/load-test-plan.md) — NFR-1/NFR-3 검증 시나리오 (실행 결과는 구현 후 `docs/test/load-test-report.md`에 기록 예정)
+- [장애 주입(Chaos) 테스트 시나리오 설계](./docs/test/chaos-test-plan.md) — NFR-2 검증 시나리오 (실행 결과는 구현 후 `docs/test/chaos-test-report.md`에 기록 예정)
 
 ## 프로젝트 구조
 
@@ -58,14 +58,30 @@ docker compose up -d
 │   ├── requirements.md
 │   ├── domain-design.md
 │   ├── database-design.md
-│   └── architecture.md
+│   ├── architecture.md
+│   └── test/
+│       ├── load-test-plan.md
+│       └── chaos-test-plan.md
 └── src/main/
     ├── kotlin/com/blog/notification/
     │   ├── NotificationSystemApplication.kt
-    │   ├── post/            # Post Bounded Context
-    │   ├── subscription/    # Subscription Bounded Context
-    │   ├── notification/    # Notification Bounded Context (Fan-out/Delivery/실시간)
-    │   └── user/            # 공유 참조 테이블(users) 모듈 — 어느 Context도 소유하지 않음
+    │   ├── common/           # 도메인에 속하지 않는 공통 인프라 (예외 처리 등)
+    │   ├── post/             # Post Bounded Context
+    │   │   ├── domain/       # Post, PostPublishedEvent
+    │   │   ├── enum/         # PostStatus
+    │   │   ├── controller/ / service/ / repository/     # 레이어
+    │   │   └── dto/
+    │   ├── subscription/     # Subscription Bounded Context
+    │   │   ├── domain/       # Subscription
+    │   │   ├── enum/         # SubscriptionStatus
+    │   │   ├── controller/ / service/ / repository/     # 레이어
+    │   │   └── dto/
+    │   ├── notification/     # Notification Bounded Context (Fan-out/Delivery/실시간)
+    │   └── user/             # 공유 참조 테이블(users) 모듈 — 어느 Context도 소유하지 않음
+    │       ├── domain/       # User
+    │       ├── enum/         # NotificationChannel
+    │       ├── controller/ / service/ / repository/     # 레이어
+    │       └── dto/
     └── resources/
         ├── application.yml
         └── db/migration/    # Flyway — 스키마 및 Context별 테이블 DDL

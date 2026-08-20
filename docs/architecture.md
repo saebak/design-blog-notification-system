@@ -243,5 +243,5 @@ sequenceDiagram
 ## 9. 다음 단계
 
 - 각 DB 테이블의 실제 DDL/인덱스 전략 → [`database-design.md`](./database-design.md) (`Subscriber Read Model`은 `(authorId, userId)` 복합 인덱스로 청크 스캔 최적화)
-- 부하 테스트 시나리오 설계 (`docs/load-test-report.md`) — §4.2의 청크 크기/워커 수 가정을 실측으로 검증
-- 장애 주입 테스트 시나리오 (`docs/chaos-test-report.md`) — 팬아웃 워커 강제 종료 후 글 등록 API 정상 동작 확인, 브로커 장애 시 Outbox Relay 재시도 확인
+- 부하 테스트 시나리오 설계: [`docs/test/load-test-plan.md`](./test/load-test-plan.md) — §4.2의 청크 크기/워커 수 가정을 실측으로 검증, 실행 결과는 `docs/test/load-test-report.md`(추후)
+- 장애 주입 테스트 시나리오 설계: [`docs/test/chaos-test-plan.md`](./test/chaos-test-plan.md) — 팬아웃 워커 강제 종료 후 글 등록 API 정상 동작 확인, 브로커 장애 시 Outbox Relay 재시도 확인, 실행 결과는 `docs/test/chaos-test-report.md`(추후)
