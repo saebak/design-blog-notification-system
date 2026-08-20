@@ -25,11 +25,18 @@
 
 ## 빌드 및 실행 방법
 
-> 프로젝트 초기 단계로, 구현 진행에 따라 갱신 예정
-
 ```bash
-# TBD
+# 1. 로컬 인프라(PostgreSQL, Kafka, Redis) 기동
+docker compose up -d
+
+# 2. 빌드
+./gradlew build
+
+# 3. 실행 (기동 시 Flyway가 스키마/테이블을 자동 생성)
+./gradlew bootRun
 ```
+
+> API/도메인 로직은 아직 스캐폴딩 단계 — 빌드 가능한 뼈대(Gradle/Kotlin/Spring Boot 프로젝트 구조, DB 마이그레이션, 로컬 인프라)만 갖춘 상태이며, 구현 진행에 따라 갱신 예정.
 
 ## 설계 문서
 
@@ -45,9 +52,23 @@
 ```
 .
 ├── README.md
-└── docs/
-    ├── requirements.md
-    ├── domain-design.md
-    ├── database-design.md
-    └── architecture.md
+├── docker-compose.yml          # 로컬 PostgreSQL / Kafka / Redis
+├── build.gradle.kts
+├── docs/
+│   ├── requirements.md
+│   ├── domain-design.md
+│   ├── database-design.md
+│   └── architecture.md
+└── src/main/
+    ├── kotlin/com/blog/notification/
+    │   ├── NotificationSystemApplication.kt
+    │   ├── post/            # Post Bounded Context
+    │   ├── subscription/    # Subscription Bounded Context
+    │   ├── notification/    # Notification Bounded Context (Fan-out/Delivery/실시간)
+    │   └── user/            # 공유 참조 테이블(users) 모듈 — 어느 Context도 소유하지 않음
+    └── resources/
+        ├── application.yml
+        └── db/migration/    # Flyway — 스키마 및 Context별 테이블 DDL
 ```
+
+모듈(패키지) 경계는 `docs/domain-design.md` §2의 Bounded Context 경계와 1:1로 맞춘다 — Context 간에는 서로의 패키지를 직접 참조하지 않고 이벤트로만 통신한다(모듈러 모놀리식, `docs/architecture.md` §2 DB 배포 토폴로지 참고).

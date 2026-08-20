@@ -1,0 +1,33 @@
+spring:
+  application:
+    name: notification-system
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/notification_system
+    username: notification
+    password: notification
+    driver-class-name: org.postgresql.Driver
+
+  flyway:
+    enabled: true
+    schemas: public
+    locations: classpath:db/migration
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: notification-system
+      auto-offset-reset: earliest
+    producer:
+      acks: all
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, prometheus
