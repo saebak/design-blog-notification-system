@@ -10,18 +10,18 @@
 
 ## 기술 스택
 
-> Language/Runtime, Backend Framework, Infra/Deploy, Load Test는 아직 미정 (TBD). 나머지는 [`docs/architecture.md`](./docs/architecture.md)에서 근거와 함께 확정.
+> 근거는 [`docs/architecture.md`](./docs/architecture.md) §2에서 항목별로 상세히 정리.
 
 | 영역 | 기술 | 비고 |
 |---|---|---|
-| Language / Runtime | TBD | |
-| Backend Framework | TBD | |
+| Language / Runtime | Kotlin (JVM) | 코루틴 기반 비동기 처리가 Kafka 컨슈머/청크 워커 동시성 코드에 유리, JVM 생태계 활용. 근거: `docs/architecture.md` §2 |
+| Backend Framework | Spring Boot | Kafka/트랜잭셔널 아웃박스/WebSocket을 표준 지원. 근거: `docs/architecture.md` §2 |
 | Message Broker | Kafka | 컨슈머 그룹 기반 수평 확장, DLQ 토픽 구성. 근거: [`docs/architecture.md`](./docs/architecture.md) §2, §7 |
 | DB (Write) | PostgreSQL (가정), 단일 인스턴스 + Context별 스키마 분리 | [`docs/database-design.md`](./docs/database-design.md)에서 DDL 작성을 위해 가정, 최종 확정 전. 모듈러 모놀리식(모듈 경계=Context 경계)으로 시작 |
 | DB (Read / Cache) | Redis | unread count 등 고빈도 조회를 발송 파이프라인과 격리(NFR-2.3). 근거: `docs/architecture.md` §2 |
 | Realtime | WebSocket + Redis Pub/Sub | 다중 인스턴스 브로드캐스트. 근거: `docs/architecture.md` §2, §6 |
-| Infra / Deploy | TBD | Docker, IaC 등 |
-| Load Test | TBD | k6 / Locust 검토 |
+| Infra / Deploy | Docker Compose | 로컬에서 Kafka/PostgreSQL/Redis/앱 다중 인스턴스를 함께 구동. 근거: `docs/architecture.md` §2 |
+| Load Test | k6 | HTTP+WebSocket 시나리오 작성 및 Grafana 연동. 근거: `docs/architecture.md` §2 |
 
 ## 빌드 및 실행 방법
 
