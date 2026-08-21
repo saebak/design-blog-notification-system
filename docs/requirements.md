@@ -111,6 +111,6 @@
 ## 5. 완료 기준 (Definition of Done)
 
 - 모든 FR/NFR 항목이 코드 또는 테스트로 검증 가능해야 한다.
-- 10만 구독자 시나리오에 대한 부하 테스트 결과가 `/docs/test/load-test-report.md`(추후 작성)에 기록되어야 한다. 시나리오 설계는 `/docs/test/load-test-plan.md` 참고.
-- 장애 주입 테스트 결과가 `/docs/test/chaos-test-report.md`(추후 작성)에 기록되어야 한다. 시나리오 설계는 `/docs/test/chaos-test-plan.md` 참고.
+- 부하 테스트 결과가 [`/docs/test/load-test-report.md`](./test/load-test-report.md)에 기록되어 있다 — 단, 로컬 리소스 제약으로 10만 구독자가 아닌 축소 규모(수백 명)로 실행했다(사유는 그 문서 §0 참고). 시나리오 설계는 `/docs/test/load-test-plan.md` 참고.
+- 장애 주입 테스트 결과가 [`/docs/test/chaos-test-report.md`](./test/chaos-test-report.md)에 기록되어 있다. 시나리오 설계는 `/docs/test/chaos-test-plan.md` 참고.
 - 아키텍처 설계는 `/docs/architecture.md`(추후 작성)에 다이어그램과 함께 정리되어야 한다.
