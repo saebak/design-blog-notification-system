@@ -38,27 +38,7 @@ docker compose up -d
 ./gradlew test
 ```
 
-## 구현 현황
-
-`docs/requirements.md` §4 개발 태스크 목록 기준. 상세 트레이드오프/스코프 축소 내역은 [`docs/decisions.md`](./docs/decisions.md) 참고.
-
-| 상태 | 항목 |
-|---|---|
-| ✅ | 사용자/작가/구독 도메인 모델 및 API |
-| ✅ | 알림 수신 설정(Push/Email/Mute) API |
-| ✅ | 글 등록 API + Outbox 테이블 + Relay 프로세스 (Post/Subscription 둘 다) |
-| ✅ | Kafka 연동 (`post.published`, `subscription.changed` 토픽) |
-| ✅ | Fan-out 컨슈머 (Subscriber Read Model 동기화 → 구독자 조회 → 알림 생성) |
-| ✅ | Push 발송 위임 (외부 Push 서버로 위임, 목업 어댑터) + 재시도/DLQ |
-| ✅ | 알림 읽음 처리 API (개별/전체) |
-| ⬜ | 부하 테스트 실행 및 결과 문서화 (`docs/test/load-test-plan.md` → `load-test-report.md`) |
-| ⬜ | 장애 주입 테스트 실행 및 결과 문서화 (`docs/test/chaos-test-plan.md` → `chaos-test-report.md`) |
-
-**스코프에서 제외된 것** (구현 안 함, 원래 요구사항에서 의도적으로 축소): Email 실제 발송, 인앱 알림 목록/unread count 조회, 실시간 채널(WebSocket/SSE), 커스텀 메트릭/모니터링 대시보드(기본 로깅만 유지), 인증/인가. 배경은 `docs/requirements.md` §3, `docs/decisions.md` 참고.
-
 ## API 엔드포인트
-
-인증 없음 — 모든 API가 사용자/수신자 id를 요청 파라미터로 직접 받는다(`docs/decisions.md` 참고).
 
 | 메서드 | 경로 | 설명 |
 |---|---|---|
