@@ -10,8 +10,6 @@
 
 ## 기술 스택
 
-> 근거는 [`docs/architecture.md`](./docs/architecture.md) §2에서 항목별로 상세히 정리.
-
 | 영역 | 기술 | 비고 |
 |---|---|---|
 | Language / Runtime | Kotlin (JVM) | 코루틴 기반 비동기 처리가 Kafka 컨슈머/청크 워커 동시성 코드에 유리, JVM 생태계 활용. 근거: `docs/architecture.md` §2 |
@@ -61,8 +59,8 @@ docker compose up -d
 - [도메인 설계](./docs/domain-design.md) — Post / Subscription / Notification Bounded Context 및 Context Map
 - [데이터베이스 설계](./docs/database-design.md) — Context별 DDL 및 인덱스 전략
 - [아키텍처 설계](./docs/architecture.md) — 메시지 브로커/2단계 Fan-out/Delivery 파이프라인/실시간 채널
-- [부하 테스트 시나리오 설계](./docs/test/load-test-plan.md) — NFR-1/NFR-3 검증 시나리오 (실행 결과는 구현 후 `docs/test/load-test-report.md`에 기록 예정)
-- [장애 주입(Chaos) 테스트 시나리오 설계](./docs/test/chaos-test-plan.md) — NFR-2 검증 시나리오 (실행 결과는 구현 후 `docs/test/chaos-test-report.md`에 기록 예정)
+- [부하 테스트 시나리오 설계](./docs/test/load-test-plan.md) / [실행 결과](./docs/test/load-test-report.md) — NFR-1/NFR-3 검증 (로컬 리소스 제약으로 축소 규모 실행, 사유는 결과 문서 §0)
+- [장애 주입(Chaos) 테스트 시나리오 설계](./docs/test/chaos-test-plan.md) / [실행 결과](./docs/test/chaos-test-report.md) — NFR-2 검증, Read Model 동기화 레이스가 실제 알림 유실로 이어지는 것을 실측
 - [구현 트레이드오프와 남은 결정사항](./docs/decisions.md) — 구현하며 스코프를 좁힌 지점과 아직 결정하지 않고 미뤄둔 사항들, 각각 다시 논의할 시점(트리거)
 
 ## 프로젝트 구조
