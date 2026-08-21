@@ -1,4 +1,4 @@
-package com.blog.notification.post.repository
+package com.blog.notification.subscription.repository
 
 import com.blog.notification.common.outbox.OutboxEventRecord
 import java.util.UUID
@@ -6,18 +6,17 @@ import org.springframework.jdbc.core.namedparam.MapSqlParameterSource
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate
 import org.springframework.stereotype.Repository
 
-// payload가 JSONB라 Spring Data JDBC 매핑 대신 직접 SQL로 처리.
+// post.repository.OutboxEventJdbcDao와 동일 패턴, subscription 스키마 전용.
 @Repository
-class OutboxEventJdbcDao(
+class SubscriptionOutboxJdbcDao(
     private val jdbcTemplate: NamedParameterJdbcTemplate,
 ) {
-    fun insertPending(aggregateType: String, aggregateId: Long, eventType: String, payloadJson: String) {
+    fun insertPending(aggregateId: Long, eventType: String, payloadJson: String) {
         val sql = """
-            INSERT INTO post.outbox_events (aggregate_type, aggregate_id, event_type, payload, status)
-            VALUES (:aggregateType, :aggregateId, :eventType, CAST(:payload AS JSONB), 'PENDING')
+            INSERT INTO subscription.subscription_outbox_events (aggregate_type, aggregate_id, event_type, payload, status)
+            VALUES ('Subscription', :aggregateId, :eventType, CAST(:payload AS JSONB), 'PENDING')
         """.trimIndent()
         val params = MapSqlParameterSource()
-            .addValue("aggregateType", aggregateType)
             .addValue("aggregateId", aggregateId)
             .addValue("eventType", eventType)
             .addValue("payload", payloadJson)
@@ -27,7 +26,7 @@ class OutboxEventJdbcDao(
     fun findPending(limit: Int): List<OutboxEventRecord> {
         val sql = """
             SELECT id, event_type, payload
-            FROM post.outbox_events
+            FROM subscription.subscription_outbox_events
             WHERE status = 'PENDING'
             ORDER BY created_at
             LIMIT :limit
@@ -41,10 +40,9 @@ class OutboxEventJdbcDao(
         }
     }
 
-    // 발행 실패 시 상태를 바꾸지 않는다 — 다음 폴링에서 자동으로 재시도된다(at-least-once).
     fun markPublished(id: UUID) {
         val sql = """
-            UPDATE post.outbox_events
+            UPDATE subscription.subscription_outbox_events
             SET status = 'PUBLISHED', published_at = now()
             WHERE id = :id
         """.trimIndent()

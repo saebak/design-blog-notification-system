@@ -1,0 +1,61 @@
+# 구현 트레이드오프와 남은 결정사항
+
+> Post 발행 → 구독자 알림 생성(Outbox + Relay + Fan-out) 1차 구현 과정에서 스코프를 좁히며 내린 선택들과, 아직 결정되지 않은 채 남겨둔 사항들을 정리한다. `docs/architecture.md`/`domain-design.md`가 "최종 목표 아키텍처"를 그린 문서라면, 이 문서는 "지금 무엇을 미뤘고 왜 미뤘는지"를 추적하는 문서다. 각 항목은 다시 논의되어야 할 시점(트리거)을 함께 적는다.
+
+## 1. Fan-out을 청크로 분산하지 않고 단일 컨슈머가 전체 처리
+
+- **현재 구현**: `PostPublishedFanoutConsumer` 하나가 `post.published` 메시지 1건당 구독자 전체를 조회해 한 번에 처리한다.
+- **원래 설계(`architecture.md` §4)**: Dispatcher가 구독자를 1,000명 단위 청크로 쪼개 `fanout.chunk.requested`에 발행하고, 여러 Chunk Worker가 병렬로 처리 — NFR-1(10만 명/5초) 충족을 위한 핵심 장치.
+- **트레이드오프**: 단일 컨슈머 방식은 구현이 단순하고 정확성 검증이 쉽지만, 인기 작가 팬아웃이 파티션 1개·컨슈머 1개에 몰려 순차 처리된다 — 대량 트래픽에서는 SLA를 못 지킨다(§0 참고).
+- **결정 필요 시점**: 부하 테스트(`docs/test/load-test-plan.md`)로 현재 구현의 처리량 한계를 실측한 뒤, 그 수치가 NFR-1 목표에 못 미치면 청크 Dispatcher/Worker 분리로 전환한다.
+
+## 2. `subscriber_read_model` 동기화와 Fan-out 사이의 최종적 일관성(eventual consistency)
+
+- **현재 구현**: `subscription.changed`(Read Model 동기화)와 `post.published`(Fan-out)는 서로 독립된 비동기 파이프라인이라 처리 순서를 보장하지 않는다. 구독 직후 곧바로 글을 발행하면, Read Model이 아직 갱신되기 전에 Fan-out이 먼저 실행돼 그 구독자가 알림 대상에서 누락될 수 있다.
+- **검증된 사실**: `PostPublishedFanoutIntegrationTest`에서 실제로 이 레이스로 인한 실패를 재현했다(구독 직후 발행 시 간헐적으로 알림 누락). 운영 시나리오에서는 구독과 발행 사이 간격이 보통 이 갭보다 훨씬 크므로 실질적 영향은 낮다고 보고 테스트만 수정(발행 전 Read Model 동기화 완료를 기다리도록)하고 프로덕션 코드는 그대로 두었다.
+- **트레이드오프**: 이 갭을 없애려면 Fan-out이 Read Model 대신 Subscription 원본을 동기 조회하거나, Post 발행을 Read Model 동기화 완료 후로 지연시켜야 하는데, 둘 다 `domain-design.md` §2가 의도적으로 피한 "Context 간 동기 결합"을 다시 끌어들인다.
+- **결정 필요 시점**: "구독 직후 즉시 발행" 같은 실사용 패턴이 실제로 발생하는지 확인되면(예: 작가가 막 구독자를 얻고 바로 공지를 올리는 경우), 허용 가능한 지연 SLA를 정하고 그에 맞는 보완책(예: Fan-out 재시도/지연 처리)을 설계한다. 지금은 "받아들이는 트레이드오프"로 문서화만 해둔다.
+
+## 3. Outbox Relay 실패 처리 — 무한 재시도, Dead Letter 없음
+
+- **현재 구현**: Kafka 발행이 실패해도 `outbox_events.status`를 바꾸지 않는다 — 다음 폴링(1초 간격)에서 같은 이벤트를 자동으로 다시 시도한다. 최대 재시도 횟수나 `FAILED`/Dead Letter 상태는 없다.
+- **트레이드오프**: 구현이 단순하고 "이벤트를 영구히 잃어버리는" 실수를 원천 차단하지만, 브로커가 장기간 죽어 있으면 같은 이벤트를 계속 재시도하며 로그만 쌓인다 — 잘못된 payload(포이즌 메시지)로 인한 영구 실패도 동일하게 무한 재시도된다.
+- **결정 필요 시점**: 운영 관측(메트릭/알림)이 붙기 전까지는 무해하지만, 실제 장애 주입 테스트(`docs/test/chaos-test-plan.md`)를 실행할 때 이 부분이 "재시도 폭주"로 보이는지 확인하고, 필요하면 재시도 횟수 상한 + Dead Letter 컬럼을 추가한다.
+
+## 4. Kafka 발행을 Relay 루프 안에서 동기 블로킹(`send().get()`)으로 처리
+
+- **현재 구현**: `PostOutboxRelay`/`SubscriptionOutboxRelay`가 이벤트를 하나씩 순회하며 `kafkaTemplate.send(...).get()`으로 ack까지 기다린 뒤 다음 이벤트로 넘어간다.
+- **트레이드오프**: 순서 보장과 실패 처리(상태 롤백 없이 다음 폴링 재시도)가 단순해지지만, 이벤트 건수가 많아지면 배치 하나(현재 500건)를 처리하는 데 걸리는 시간이 늘어나 relay 폴링 주기(1초)를 못 맞출 수 있다.
+- **결정 필요 시점**: 부하 테스트에서 outbox 적체(backlog)가 관찰되면, 비동기 콜백 기반 발행 + 배치 단위 상태 업데이트로 전환한다.
+
+## 5. `SubscriberSyncConsumer`와 `PostPublishedFanoutConsumer`가 같은 Kafka consumer group을 공유
+
+- **현재 구현**: `application.yml`의 `spring.kafka.consumer.group-id: notification-system` 하나를 두 리스너가 그대로 공유한다 — 각기 다른 토픽(`subscription.changed`, `post.published`)을 구독하지만 그룹은 동일하다.
+- **트레이드오프**: 지금은 문제없이 동작하지만(각자 자기 토픽의 파티션만 할당받음), 같은 그룹 안에 서로 다른 구독 목록을 가진 컨슈머가 섞이는 구성은 Kafka에서 권장되지 않는 패턴이다 — 인스턴스를 여러 개로 늘리거나 리밸런싱이 잦아지면 예상치 못한 파티션 재할당이 생길 수 있다.
+- **결정 필요 시점**: 인스턴스를 2개 이상으로 스케일아웃하기 전에 컨슈머별로 별도 group-id(`notification-system-subscriber-sync`, `notification-system-fanout` 등)로 분리한다.
+
+## 6. 초기 백필 배치는 범위 밖
+
+- **현재 구현**: `subscriber_read_model` 초기 백필 배치는 미구현 — 신규 배포 시 기존 구독 데이터가 있어도 이벤트 재생 없이는 Read Model이 비어있는 상태로 시작한다.
+- **트레이드오프**: 이번 요청("구독+알림설정된 사용자에게 알림 생성")의 최소 범위를 벗어나므로 의도적으로 미룸. 백필 전까지는 팬아웃 대상에서 기존 구독자가 전부 누락된다.
+- **결정 필요 시점**: 이 시스템을 실제로 기존 구독 데이터가 있는 환경에 배포하기 전에 반드시 백필 배치부터 구현해야 한다 — 그 전까지는 "처음부터 새로 시작하는 시스템"에서만 정합성이 보장된다.
+
+## 7. Push 발송 재시도/DLQ — Kafka 토픽 대신 DB 폴링 워커
+
+- **결정**: `architecture.md` §5가 설계한 `delivery.push.requested`/`delivery.push.dlq` Kafka 토픽 기반 구조 대신, `PushDeliveryWorker`가 `notification.notification_delivery_log`를 `@Scheduled(fixedDelay=1000)`로 폴링하는 방식으로 구현했다. `PostOutboxRelay`/`SubscriptionOutboxRelay`와 동일한 패턴이며, 이 테이블에 이미 있던 `idx_notification_delivery_retry_queue` 인덱스가 정확히 이 폴링을 겨냥한 것이었다.
+- **근거**: `architecture.md` §5가 "채널별 토픽 분리"를 원한 이유는 FR-3.4(한 채널 장애가 다른 채널에 영향 없음)였는데, 이 시스템은 Push 채널만 지원하므로 격리할 다른 채널이 없다 — 토픽 분리의 원래 근거가 소멸했다. 새 Kafka 토픽/컨슈머 그룹을 추가하는 비용 대비 얻는 게 없다고 판단했다.
+- **재시도 정책**: `architecture.md` §5의 예시(1s, 2s, 4s, 최대 3회)를 그대로 따르지 않고 근사치로 단순화했다 — attempt 1회차는 즉시, 이후 `2^(attempt_count-1)`초 백오프(1s, 2s)로 최대 3회 시도 후 `DEAD_LETTER` 전이. "최대 3회"면 3번째 시도 전 대기가 2s로 끝나 4s 대기까지는 가지 않는다.
+- **트레이드오프**: `delivery.push.requested`의 파티션 분산(원 설계 — "랜덤/round-robin, 높음(32)")이 주려던 "발송 요청을 여러 워커에 넓게 분산"하는 수평 확장성은 지금 없다 — `PushDeliveryWorker`는 인스턴스 하나당 순차 폴링이다. 인기 작가 팬아웃으로 delivery log가 대량 쌓이면 이 워커 하나가 병목이 될 수 있다.
+- **결정 필요 시점**: Push 외 다른 채널을 다시 지원하게 되거나, 부하 테스트에서 이 워커가 병목으로 드러나면 Kafka 토픽 기반 구조로 전환한다.
+
+## 요약 — 지금 결정이 필요한 것 vs 나중으로 미뤄도 되는 것
+
+| 항목 | 지금 결정 필요? | 트리거 |
+|---|---|---|
+| 1. 청크 미분산 | 아니오 | 부하 테스트 결과가 NFR-1 미달일 때 |
+| 2. Read Model 동기화 레이스 | 아니오 (문서화로 충분) | "구독 직후 즉시 발행" 패턴이 실사용에서 확인될 때 |
+| 3. Relay 무한 재시도 | 아니오 | 장애 주입 테스트에서 재시도 폭주가 관측될 때 |
+| 4. Relay 동기 블로킹 발행 | 아니오 | 부하 테스트에서 outbox 적체가 관측될 때 |
+| 5. Consumer group 공유 | **예 — 인스턴스 스케일아웃 전에** | 앱을 2개 이상 인스턴스로 띄우기 전 |
+| 6. 백필 배치 미구현 | **예 — 기존 데이터 있는 환경 배포 전** | 프로덕션/기존 구독 데이터 마이그레이션 시 |
+| 7. Push 재시도/DLQ — DB 폴링, Kafka 토픽 없음 | 확정됨 (재논의 불필요) | Push 이외 채널을 다시 지원하며 채널별 장애 격리가 다시 필요해질 때 |
