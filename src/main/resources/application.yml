@@ -18,6 +18,15 @@ spring:
       host: localhost
       port: 6379
 
+  task:
+    scheduling:
+      pool:
+        # 기본값 1이면 PostOutboxRelay/SubscriptionOutboxRelay/PushDeliveryWorker가 @Scheduled 스레드
+        # 하나를 공유한다 — 한쪽이 대량 백로그를 처리하며 블로킹되면 나머지가 굶는다
+        # (docs/decisions.md §5, 장애 주입 테스트로 실측된 알림 유실 원인 중 하나).
+        # 현재 스케줄 컴포넌트 수(3개)만큼 최소한의 스레드를 배정해 서로 독립적으로 돈다.
+        size: 3
+
   kafka:
     bootstrap-servers: localhost:9092
     consumer:
