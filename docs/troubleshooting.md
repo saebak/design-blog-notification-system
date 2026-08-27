@@ -141,6 +141,34 @@ done
 
 ---
 
+### 3.3 배치 리스너 전용 `ConsumerFactory`를 직접 만들었다가 Testcontainers 동적 포트를 우회함
+
+**증상**: `SubscriberSyncConsumer`를 배치 리스너로 전환한 뒤(§1 컨슈머 처리 속도 개선 작업), `PostPublishedFanoutIntegrationTest`/`SubscribeThenImmediatePublishIntegrationTest`가 `subscriber_read_model` 동기화를 기다리다 타임아웃으로 실패했다. `PostPublishedFanoutConsumer`(기존 단건 리스너)는 정상 동작했다.
+
+**진단 과정**: `--info` 로그를 켜고 배치 리스너 컨슈머(`consumer-subscriber-sync-*`)만 추적해보니 `partitions assigned` 로그가 아예 없고, 대신 `Connection to node -1 (localhost/127.0.0.1:9092) could not be established`가 반복됐다. `application.yml`의 고정 주소(`localhost:9092`)로 연결을 시도하고 있었다 — Testcontainers가 매 테스트마다 임의 포트로 띄우는 실제 브로커가 아니라.
+
+**근본 원인**: 배치 리스너 전용 `ConcurrentKafkaListenerContainerFactory`를 만들면서 `DefaultKafkaConsumerFactory(kafkaProperties.buildConsumerProperties())`로 `ConsumerFactory`를 직접 새로 구성했는데, 이 방식은 Spring Boot가 `@ServiceConnection`/`KafkaConnectionDetails`로 테스트용 동적 포트를 주입하는 자동설정 경로를 타지 않는다. 자동설정된 `ConsumerFactory`/`ProducerFactory`/`AdminClient` 빈들만 `KafkaConnectionDetails`를 우선 참조하도록 되어 있고, `KafkaProperties.getBootstrapServers()`를 직접 읽으면 `application.yml`에 적힌 값 그대로 쓰인다.
+
+**해결**: 새 `ConsumerFactory`를 직접 만드는 대신, 이미 올바르게(동적 포트 포함) 구성된 자동설정 `ConsumerFactory<String, String>` 빈을 주입받아 배치 리스너 팩토리에 그대로 재사용하도록 바꿨다.
+
+**교훈**: Spring Boot 자동설정이 제공하는 인프라 연결 빈(`ConsumerFactory`, `DataSource` 등)을 손으로 다시 만들 때는, 그 자동설정이 `@ServiceConnection` 같은 테스트/런타임 오버라이드 메커니즘과 어떻게 연결되어 있는지부터 확인해야 한다. "설정값(`KafkaProperties`)을 그대로 읽어서 새로 만들면 똑같이 동작하겠지"라는 가정이 이번엔 틀렸다 — 오버라이드는 설정값이 아니라 빈 생성 경로에 걸려 있었다.
+
+---
+
+### 3.4 컨슈머 concurrency를 올리자 §5-b(consumer group 공유)가 실제 장애로 드러남
+
+**증상**: 3.3을 고친 뒤에도 여전히 같은 두 테스트가 타임아웃으로 실패했다. `SubscriberSyncConsumer` 쪽 컨슈머(`consumer-subscriber-sync-2`~`7`)가 `subscription.changed`에 `Subscribed to topic(s)`까지는 찍히는데, 그 이후로 아무 로그도 없이 멈췄다.
+
+**진단 과정**: `decisions.md` §5-b에 이미 "`SubscriberSyncConsumer`와 `PostPublishedFanoutConsumer`가 같은 consumer group(`notification-system`)을 공유한다"는 게 미해결 이슈로 적혀 있었다는 걸 기억해내고, 리밸런싱 로그를 다시 살펴봤다. `Resetting generation ... Request joining group ... pro-actively leaving the group`이 여러 멤버에서 계속 반복되고 있었다 — 리밸런싱이 끝나지 않고 있었다.
+
+**근본 원인**: 두 리스너가 같은 그룹을 공유하는 것 자체는 이전에도(concurrency=1일 때) 문제없이 동작했지만, `subscription.changed` 쪽 concurrency를 6으로 올리면서 한 그룹 안에 "post.published만 구독하는 멤버 1개"와 "subscription.changed만 구독하는 멤버 6개"가 섞이게 됐다. 서로 다른 구독 목록을 가진 멤버가 늘어나면서 그룹 리밸런싱이 안정적으로 수렴하지 못했다.
+
+**해결**: `@KafkaListener(groupId = ...)`로 두 리스너의 그룹을 `subscriber-sync`/`post-fanout`으로 명시적으로 분리했다.
+
+**교훈**: 문서(`decisions.md`)에 "지금은 문제없이 동작하지만 잠재적 위험"이라고 적어둔 트레이드오프도, 주변 조건(이번엔 concurrency)이 바뀌면 잠재 위험에서 실제 장애로 넘어갈 수 있다. 관련 있는 다른 변경을 하기 전에 그 변경이 이미 알려진 미해결 이슈를 건드리지는 않는지 `decisions.md`를 먼저 훑어보는 습관이 있었다면 더 빨리 의심할 수 있었을 것이다.
+
+---
+
 ## 4. Git / GitHub
 
 ### 4.1 커밋은 쌓이는데 GitHub 컨트리뷰션 그래프(잔디)에 안 뜸

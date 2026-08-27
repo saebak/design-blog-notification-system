@@ -83,7 +83,7 @@ docker compose up -d
     ├── kotlin/com/blog/notification/
     │   ├── NotificationSystemApplication.kt
     │   ├── common/
-    │   │   ├── kafka/        # 토픽 이름 상수
+    │   │   ├── kafka/        # 토픽 이름 상수, 토픽 파티션/컨슈머 배치 리스너 설정
     │   │   ├── outbox/       # Outbox Relay 공용 레코드 타입
     │   │   └── (예외 처리 등 도메인에 속하지 않는 공통 인프라)
     │   ├── post/             # Post Bounded Context

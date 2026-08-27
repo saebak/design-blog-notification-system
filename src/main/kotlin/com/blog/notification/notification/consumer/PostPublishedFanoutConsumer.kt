@@ -26,7 +26,7 @@ class PostPublishedFanoutConsumer(
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
 
-    @KafkaListener(topics = [KafkaTopics.POST_PUBLISHED])
+    @KafkaListener(topics = [KafkaTopics.POST_PUBLISHED], groupId = "post-fanout")
     fun onMessage(payload: String) {
         val message = objectMapper.readValue(payload, PostPublishedMessage::class.java)
         val subscriberIds = findSubscribersWithRetry(message.authorId)

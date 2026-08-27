@@ -9,6 +9,11 @@
 - **트레이드오프**: 단일 컨슈머 방식은 구현이 단순하고 정확성 검증이 쉽지만, 인기 작가 팬아웃이 파티션 1개·컨슈머 1개에 몰려 순차 처리된다 — 대량 트래픽에서는 SLA를 못 지킨다(§0 참고).
 - **결정 필요 시점**: 부하 테스트(`docs/test/load-test-plan.md`)로 현재 구현의 처리량 한계를 실측한 뒤, 그 수치가 NFR-1 목표에 못 미치면 청크 Dispatcher/Worker 분리로 전환한다.
 - **[2026-08-21 실측 갱신]**: `docs/test/load-test-report.md` 시나리오 A에서 실측 — 구독자 300명 기준 알림 생성까지 약 112 msg/sec, 목표(20,000 msg/sec) 대비 약 179배 부족. 300명 기준 선형 추정 시 10만 명 처리에는 약 15분이 걸릴 것으로 추정된다. 청크 Dispatcher/Worker 분리가 필요하다는 근거가 실측으로 확보됐다.
+- **[2026-08-27 부분 조치 완료 — SubscriberSyncConsumer 처리 속도]**: §1.3(`chaos-test-report.md`)에서 실제 병목으로 드러난 건 `PostPublishedFanoutConsumer`가 아니라 `SubscriberSyncConsumer`(`subscription.changed` 컨슈머)의 순차 처리 속도(259초)였다. `post.published`/`subscription.changed` 두 토픽을 파티션 6개로 명시 생성(`KafkaTopicConfig`, 이전엔 브로커 기본값인 1개로 자동 생성되고 있었다)하고, `SubscriberSyncConsumer`를 배치 리스너(`concurrency=6`) + `@Transactional`로 전환해 메시지마다 개별 커밋하던 것을 배치당 1커밋으로 묶었다.
+  - **구현 중 겪은 문제 1 — Testcontainers 동적 포트 우회**: 배치 리스너 전용 `ConsumerFactory`를 `KafkaProperties.buildConsumerProperties()`로 직접 만들었더니, Spring Boot의 `KafkaConnectionDetails` 기반 동적 포트 주입(Testcontainers)을 우회해 `application.yml`의 고정 주소로 연결을 시도하며 파티션을 영영 할당받지 못했다. 자동설정된 `ConsumerFactory` 빈을 그대로 재사용하도록 고쳐 해결(`BatchKafkaListenerConfig`).
+  - **구현 중 겪은 문제 2 — 겹쳐서 드러난 §5-b**: concurrency를 6으로 늘리자 `SubscriberSyncConsumer`와 `PostPublishedFanoutConsumer`가 같은 consumer group(`notification-system`)을 공유하던 §5-b 이슈가 실제 장애로 나타났다 — 서로 다른 구독을 가진 멤버들이 리밸런싱을 반복하며 `subscription.changed` 쪽에 파티션이 아예 할당되지 않았다. 두 리스너에 명시적으로 별도 group-id(`subscriber-sync`, `post-fanout`)를 부여해 §5-b까지 함께 해결(§5 참고).
+  - **검증**: 기존 통합 테스트 전체(`./gradlew test`) 회귀 없이 통과. 다만 §1.3에서 실측한 "7,610건 백로그 / 259초" 시나리오를 같은 조건으로 재현하는 chaos 재검증은 아직 하지 않았다 — 처리 속도가 실제로 얼마나 개선됐는지는 다음 재현 테스트에서 수치로 확인해야 한다.
+  - **남은 부분**: `PostPublishedFanoutConsumer` 자체의 청크 분산(Dispatcher/Chunk Worker, `architecture.md` §4)은 여전히 미착수 — 이번 조치는 §1 중 "컨슈머 처리 속도" 부분만 다뤘다.
 
 ## 2. `subscriber_read_model` 동기화와 Fan-out 사이의 최종적 일관성(eventual consistency)
 
@@ -46,6 +51,7 @@
 - **결정 필요 시점**: 인스턴스를 2개 이상으로 스케일아웃하기 전에 컨슈머별로 별도 group-id(`notification-system-subscriber-sync`, `notification-system-fanout` 등)로 분리한다.
 - **[2026-08-21 실측 추가]**: 이건 Kafka consumer group 얘기와는 별개로, `@Scheduled` 작업(`PostOutboxRelay`, `SubscriptionOutboxRelay`, `PushDeliveryWorker`)도 Spring Boot 기본 설정상 **단일 스레드 스케줄러 하나를 전부 공유**한다. 장애 주입 테스트(`docs/test/chaos-test-report.md` §1.1)에서 `SubscriptionOutboxRelay`가 약 11,700건의 백로그를 처리하는 동안 다른 Relay/Worker가 지연되는 것을 실측했다 — 단일 인스턴스에서도 발생하는 문제라 "인스턴스 스케일아웃 전"이라는 기존 트리거로는 충분하지 않다. **새 결정 필요 시점**: Relay/Worker별로 별도 스케줄러 스레드(또는 스레드 풀)를 쓰도록 `TaskScheduler` 빈을 분리한다 — 지금처럼 여러 스케줄 작업이 하나의 스레드를 공유하면, 한 작업의 백로그가 다른 작업의 지연 보장을 깨뜨릴 수 있다.
 - **[2026-08-24 조치 완료 — 스케줄러 풀 크기 확장]**: `application.yml`에 `spring.task.scheduling.pool.size: 3`을 추가해 해결했다. Spring Boot가 기본 제공하는 `ThreadPoolTaskScheduler`의 풀 크기를 현재 스케줄 컴포넌트 수(3개)만큼 늘린 것으로, 새 스케줄러 구현이나 코드 변경 없이 설정 한 줄로 해결됐다(가장 작은 변경으로 가장 큰 위험을 없애는 방향을 택함 — Bean을 직접 나누는 대신 기본 자동설정이 이미 제공하는 풀 크기 옵션만 조정). `/actuator/threaddump`로 `scheduling-1`/`scheduling-2`/`scheduling-3` 세 개의 독립된 스레드가 실제로 존재함을 확인했고, 전체 테스트 스위트도 회귀 없이 통과했다. Kafka consumer group 공유(같은 섹션 상단) 자체는 여전히 미해결 — 이건 별도 그룹 ID 분리가 필요하며 스케줄러 풀 크기와는 무관하다.
+- **[2026-08-27 조치 완료 — Consumer group 분리]**: §1의 `SubscriberSyncConsumer` 배치 전환 작업 중 이 이슈가 이론적 우려가 아니라 실제 장애(리밸런싱 반복으로 파티션 미할당)로 나타나는 것을 직접 확인했다. `@KafkaListener(groupId = ...)`로 `SubscriberSyncConsumer`는 `subscriber-sync`, `PostPublishedFanoutConsumer`는 `post-fanout`으로 그룹을 분리해 해결했다. 인스턴스 스케일아웃 여부와 무관하게, 단일 인스턴스에서도 문제였다는 게 이번에 드러난 점 — 기존에 "스케일아웃 전"으로 적어둔 트리거는 실제보다 늦은 기준이었다.
 
 ## 6. 초기 백필 배치는 범위 밖
 
@@ -65,11 +71,11 @@
 
 | 항목 | 지금 결정 필요? | 트리거 |
 |---|---|---|
-| 1. 청크 미분산 | **예 — 실측 확인됨, 우선순위 상향(2026-08-25)** | 부하 테스트에서 처리량 179배 부족 실측 + §4 조치 후 병목이 이쪽(컨슈머 처리 속도)으로 이동한 것까지 확인 — 이제 §2를 완전히 닫기 위한 마지막 조각 |
-| 2. Read Model 동기화 레이스 | ⚠️ **부분 조치 완료, 근본 원인은 §1로 이동** | Fan-out 재시도(~4초)로 일반적인 케이스는 흡수. §4까지 고쳐도 대량 백로그에서는 컨슈머 처리 지연(§1)으로 여전히 재현됨(2026-08-25 재재현, 259초) |
+| 1. 청크 미분산 / 컨슈머 처리 속도 | ⚠️ **부분 조치 완료(2026-08-27)** | `SubscriberSyncConsumer` 배치 전환 + 파티션 6개로 처리 속도 개선, 통합 테스트 회귀 없음 확인. `PostPublishedFanoutConsumer`의 청크 Dispatcher/Worker 분리(`architecture.md` §4)는 여전히 미착수. §1.3 시나리오(7,610건/259초) 재현 재검증도 아직 안 함 |
+| 2. Read Model 동기화 레이스 | ⚠️ **부분 조치 완료, §1 처리 속도 개선과 함께 재평가 필요** | Fan-out 재시도(~4초)로 일반적인 케이스는 흡수. §1의 컨슈머 처리 속도 개선이 대량 백로그 시나리오(2026-08-25 재재현, 259초)를 얼마나 줄였는지는 재현 테스트로 다시 확인해야 함 |
 | 3. Relay 무한 재시도 | 아니오 (정상 동작 확인됨) | 장애 주입 테스트에서 재시도 폭주 없이 결국 전량 발행됨을 확인(`chaos-test-report.md` §1) |
 | 4. Relay 동기 블로킹 발행 | ✅ **조치 완료(2026-08-25)** | 비동기 콜백 + in-flight 중복 방지로 전환. Outbox→Kafka 드레인 시간 70~240초 → 약 7초로 단축 실측(`chaos-test-report.md` §1.3) |
 | 5-a. 스케줄러 스레드 공유 | ✅ **조치 완료(2026-08-24)** | `spring.task.scheduling.pool.size: 3`으로 해결, `/actuator/threaddump`로 검증 |
-| 5-b. Consumer group 공유 | **예 — 인스턴스 스케일아웃 전에** | 앱을 2개 이상 인스턴스로 띄우기 전 (스케줄러 풀 크기 조정과는 별개 이슈, 미해결) |
+| 5-b. Consumer group 공유 | ✅ **조치 완료(2026-08-27)** | `subscriber-sync`/`post-fanout`로 group-id 분리. 단일 인스턴스에서도 리밸런싱 반복으로 실제 장애가 나는 것을 확인하고 고침 |
 | 6. 백필 배치 미구현 | **예 — 기존 데이터 있는 환경 배포 전** | 프로덕션/기존 구독 데이터 마이그레이션 시 |
 | 7. Push 재시도/DLQ — DB 폴링, Kafka 토픽 없음 | 확정됨 (재논의 불필요) | Push 이외 채널을 다시 지원하며 채널별 장애 격리가 다시 필요해질 때 |
