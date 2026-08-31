@@ -55,11 +55,11 @@
 - **[2026-08-24 조치 완료 — 스케줄러 풀 크기 확장]**: `application.yml`에 `spring.task.scheduling.pool.size: 3`을 추가해 해결했다. Spring Boot가 기본 제공하는 `ThreadPoolTaskScheduler`의 풀 크기를 현재 스케줄 컴포넌트 수(3개)만큼 늘린 것으로, 새 스케줄러 구현이나 코드 변경 없이 설정 한 줄로 해결됐다(가장 작은 변경으로 가장 큰 위험을 없애는 방향을 택함 — Bean을 직접 나누는 대신 기본 자동설정이 이미 제공하는 풀 크기 옵션만 조정). `/actuator/threaddump`로 `scheduling-1`/`scheduling-2`/`scheduling-3` 세 개의 독립된 스레드가 실제로 존재함을 확인했고, 전체 테스트 스위트도 회귀 없이 통과했다. Kafka consumer group 공유(같은 섹션 상단) 자체는 여전히 미해결 — 이건 별도 그룹 ID 분리가 필요하며 스케줄러 풀 크기와는 무관하다.
 - **[2026-08-27 조치 완료 — Consumer group 분리]**: §1의 `SubscriberSyncConsumer` 배치 전환 작업 중 이 이슈가 이론적 우려가 아니라 실제 장애(리밸런싱 반복으로 파티션 미할당)로 나타나는 것을 직접 확인했다. `@KafkaListener(groupId = ...)`로 `SubscriberSyncConsumer`는 `subscriber-sync`, `PostPublishedFanoutConsumer`는 `post-fanout`으로 그룹을 분리해 해결했다. 인스턴스 스케일아웃 여부와 무관하게, 단일 인스턴스에서도 문제였다는 게 이번에 드러난 점 — 기존에 "스케일아웃 전"으로 적어둔 트리거는 실제보다 늦은 기준이었다.
 
-## 6. 초기 백필 배치는 범위 밖
+## 6. 초기 백필 배치
 
-- **현재 구현**: `subscriber_read_model` 초기 백필 배치는 미구현 — 신규 배포 시 기존 구독 데이터가 있어도 이벤트 재생 없이는 Read Model이 비어있는 상태로 시작한다.
-- **트레이드오프**: 이번 요청("구독+알림설정된 사용자에게 알림 생성")의 최소 범위를 벗어나므로 의도적으로 미룸. 백필 전까지는 팬아웃 대상에서 기존 구독자가 전부 누락된다.
-- **결정 필요 시점**: 이 시스템을 실제로 기존 구독 데이터가 있는 환경에 배포하기 전에 반드시 백필 배치부터 구현해야 한다 — 그 전까지는 "처음부터 새로 시작하는 시스템"에서만 정합성이 보장된다.
+- **이전 구현**: `subscriber_read_model` 초기 백필 배치가 없어 신규 배포 시 기존 구독 데이터가 있어도 이벤트 재생 없이는 Read Model이 비어 있었다.
+- **운영 방식**: 일반 기동에서는 실행하지 않고, 기존 데이터가 있는 환경의 최초 배포 또는 Read Model 재구축 시 명시적으로 활성화하는 1회성 잡으로 둔다.
+- **[2026-08-31 조치 완료]**: `SubscriberReadModelBackfillService`와 opt-in `SubscriberReadModelBackfillRunner`를 구현했다. `subscriptions.id` 키셋 페이지(기본 1,000건)로 ACTIVE 구독을 읽어 bulk upsert하고, 재구축 시 원본 ACTIVE 구독이 없는 stale Read Model 행도 먼저 제거한다. 페이지 조회와 적재는 같은 트랜잭션이며 원본 행에 `FOR SHARE`를 사용해 동시 취소가 삭제 이벤트보다 늦은 stale 적재로 뒤집히는 것을 방지한다. `notification.subscriber-read-model.backfill.enabled=true`인 배포에서만 1회 실행하며 기본값은 false다. 통합 테스트로 페이지 경계, CANCELLED 제외, stale 제거, 재실행 멱등성을 검증한다.
 
 ## 7. Push 발송 재시도/DLQ — Kafka 토픽 대신 DB 폴링 워커
 

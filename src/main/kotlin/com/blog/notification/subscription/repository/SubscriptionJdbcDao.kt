@@ -103,4 +103,26 @@ class SubscriptionJdbcDao(
             .addValue("limit", limit)
         return jdbcTemplate.query(sql, params, rowMapper)
     }
+
+    /**
+     * Reads the next global page for rebuilding the subscriber read model.
+     *
+     * FOR SHARE keeps an active row stable until the page has been copied. A concurrent
+     * cancellation therefore cannot publish and consume its delete event before this page
+     * commits, which would otherwise allow the backfill to resurrect a cancelled subscriber.
+     */
+    fun findActiveAfterIdForBackfill(cursor: Long?, limit: Int): List<Subscription> {
+        val sql = """
+            SELECT id, user_id, author_id, status, subscribed_at, cancelled_at
+            FROM subscription.subscriptions
+            WHERE status = 'ACTIVE' AND id > :cursor
+            ORDER BY id
+            LIMIT :limit
+            FOR SHARE
+        """.trimIndent()
+        val params = MapSqlParameterSource()
+            .addValue("cursor", cursor ?: 0L)
+            .addValue("limit", limit)
+        return jdbcTemplate.query(sql, params, rowMapper)
+    }
 }

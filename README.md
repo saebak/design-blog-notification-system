@@ -36,6 +36,12 @@ docker compose up -d
 ./gradlew test
 ```
 
+기존 구독 데이터가 있는 환경의 최초 배포 또는 Read Model 재구축 시에만 백필을 opt-in으로 실행한다. 완료 후에는 반드시 기본값(`false`)으로 되돌린다.
+
+```bash
+./gradlew bootRun --args='--notification.subscriber-read-model.backfill.enabled=true --notification.subscriber-read-model.backfill.page-size=1000'
+```
+
 ## API 엔드포인트
 
 | 메서드 | 경로 | 설명 |

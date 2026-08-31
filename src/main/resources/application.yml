@@ -44,3 +44,10 @@ management:
     web:
       exposure:
         include: health, info, prometheus
+
+notification:
+  subscriber-read-model:
+    backfill:
+      # 기존 구독 데이터가 있는 환경의 최초 배포/Read Model 재구축 때만 true로 실행한다.
+      enabled: false
+      page-size: 1000
