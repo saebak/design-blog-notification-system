@@ -1,0 +1,201 @@
+# 트러블슈팅 기록
+
+> `docs/decisions.md`가 "무엇을 스코프에서 뺐고 왜 뺐는지"를 다루는 문서라면, 이 문서는 **실제로 겪은 문제와 그걸 어떻게 진단해서 해결했는지**를 다룬다. 설계 단계에서 예상한 트레이드오프가 아니라, 구현/테스트/배포 과정에서 부딪힌 구체적인 사건들의 기록이다. 각 항목은 증상 → 진단 과정 → 근본 원인 → 해결 → 교훈 순으로 적는다.
+
+---
+
+## 1. 로컬 개발 환경 문제
+
+### 1.1 Testcontainers Kafka 컨테이너 기동 타임아웃 (메모리 부족)
+
+**증상**: `./gradlew test`를 반복 실행하면 가끔 `Testcontainers`가 Kafka 컨테이너를 못 띄우고 실패했다.
+```
+Caused by: org.testcontainers.containers.ContainerLaunchException:
+Timed out waiting for log output matching '.*Transitioning from RECOVERY to RUNNING.*'
+```
+같은 테스트를 다시 실행하면 통과하는 등 재현이 일정하지 않았다.
+
+**진단 과정**: 실패 직후 `wmic OS get FreePhysicalMemory`로 여유 메모리를 확인해보니 1GB 안팎이었다(전체 16GB 중). 매 테스트 클래스마다 Postgres+Kafka+Redis 컨테이너를 새로 띄우는데(Spring 컨텍스트가 서로 다른 `@TestConfiguration` 조합을 쓰면 캐시를 못 씀), 컨테이너 기동 자체가 메모리를 두고 경쟁하고 있었다.
+
+**근본 원인**: 로컬 개발 환경의 가용 메모리가 Testcontainers 기반 테스트 스위트를 안정적으로 돌리기엔 빠듯했다. 코드 문제가 아니라 인프라 문제.
+
+**해결**: 근본적으로는 메모리를 늘리는 것 외엔 해결책이 없었다. 대신 이후 작업에서는:
+- `./gradlew --stop`으로 불필요한 Gradle 데몬을 정리하고,
+- 수동 부하/장애 테스트 시 앱 JVM 힙을 `-Xmx384m`으로 제한해 여유를 확보하고,
+- 실패한 테스트는 **단독 실행으로 재현되는지부터 확인**해서 "진짜 회귀"와 "인프라 flake"를 구분하는 습관을 들였다(§2.2 참고).
+
+**교훈**: CI/로컬 모두에서 리소스 여유가 없는 상태로 통합 테스트를 돌리면, 실패 원인이 코드인지 환경인지 구분하는 절차 자체를 마련해두지 않으면 매번 헷갈린다. "일단 다시 돌려보고 통과하면 넘어간다"가 아니라 **표준 진단 순서(단독 재실행 → 로그 확인 → 필요시 재현 스크립트)**를 정해두는 게 낫다.
+
+---
+
+### 1.2 k6 미설치 + Bash에서 PATH 인식 안 됨
+
+**증상**: 부하 테스트 스크립트를 실행하려는데 `k6: command not found`.
+
+**진단 과정**: `winget search k6`로 검색해보니 패키지 ID가 `k6.k6`이 아니라 `GrafanaLabs.k6`였다(첫 시도는 ID를 잘못 짚어 실패). 설치 후에도 PowerShell에서는 `Get-Command k6`로 잡히는데 Bash 세션에서는 여전히 `command not found`였다.
+
+**근본 원인**: winget으로 설치한 실행 파일의 PATH 등록이 새로 연 셸 세션에는 반영됐지만, 이미 열려있던 Bash 세션의 환경변수에는 반영되지 않았다.
+
+**해결**: 매번 새 Bash 세션을 열지 않고, 설치 경로(`C:\Program Files\k6\k6.exe`)를 절대 경로로 직접 호출하는 방식으로 우회했다:
+```bash
+"/c/Program Files/k6/k6.exe" run scripts/load-test/subscribe-throughput.js
+```
+
+**교훈**: Windows에서 새로 설치한 CLI 도구가 안 잡히면 재설치를 의심하기 전에 "PATH가 새 세션에만 반영됐을 가능성"부터 확인하면 시간을 아낄 수 있다.
+
+---
+
+### 1.3 Spring Boot 4에서 `AutoConfigureMockMvc` 패키지 이동
+
+**증상**: `NotificationReadApiTest`에 MockMvc 테스트를 추가하면서 익숙한 import를 썼는데 컴파일 에러가 났다.
+```
+e: Unresolved reference 'web'.
+e: Unresolved reference 'AutoConfigureMockMvc'.
+```
+`import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc` — Spring Boot 2/3에서 늘 쓰던 경로인데 안 먹었다.
+
+**진단 과정**: 어느 jar에 그 클래스가 실제로 있는지 gradle 캐시를 직접 뒤졌다.
+```bash
+for f in $(find ~/.gradle/caches/modules-2 -iname "*.jar" ! -iname "*sources*" ! -iname "*javadoc*"); do
+  if unzip -l "$f" 2>/dev/null | grep -q "AutoConfigureMockMvc.class"; then echo "$f"; fi
+done
+```
+결과: `spring-boot-webmvc-test-4.1.0.jar` 안에 `org/springframework/boot/webmvc/test/autoconfigure/AutoConfigureMockMvc.class`로 옮겨가 있었다.
+
+**근본 원인**: Spring Boot 4에서 웹 관련 테스트 자동설정 클래스들이 `spring-boot-test-autoconfigure`라는 큰 아티팩트에서 `spring-boot-webmvc-test` 같은 더 세분화된 아티팩트로 쪼개지면서 패키지 경로도 함께 바뀌었다. 지식이 예전 버전 기준으로 고정되어 있으면 이런 이동을 놓치기 쉽다.
+
+**해결**: import를 `org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc`로 수정.
+
+**교훈**: 메이저 버전을 앞서가는 프레임워크(이 프로젝트는 Boot 4.1.0)를 쓸 때는 "예전에 쓰던 import가 안 먹으면 이름이 바뀐 게 아니라 패키지/아티팩트 자체가 옮겨갔을 가능성"부터 의심하고, 확실하지 않으면 직접 jar를 까서 확인하는 게 검색으로 헤매는 것보다 빠를 때가 있다.
+
+---
+
+## 2. 테스트 신뢰성 (Flaky Tests)
+
+### 2.1 `PostPublishedFanoutIntegrationTest`가 간헐적으로 실패
+
+**증상**: 구독 직후 바로 글을 발행하는 통합 테스트가 어떤 때는 통과하고 어떤 때는 타임아웃으로 실패했다.
+
+**진단 과정**: 실패 시점의 상태를 눈으로 보기 위해 테스트에 진단용 덤프 메서드(`dumpDiagnostics`)를 추가해 outbox 상태, `subscriber_read_model`, `notifications` 테이블을 전부 찍어보게 했다. 로그를 보니 `subscriber_read_model`은 결국 채워지지만, `post.published` 컨슈머가 그보다 먼저 실행돼 구독자 0명으로 판단하고 조기 종료한 뒤였다.
+
+**근본 원인**: `subscription.changed`(Read Model 동기화)와 `post.published`(Fan-out)는 서로 독립된 비동기 파이프라인이라 처리 순서를 보장하지 않는다 — 구독 이벤트가 아직 소비되기 전에 발행 이벤트가 먼저 소비될 수 있다.
+
+**해결**: 이 레이스 자체는 실제 운영에서도 존재하는 설계상의 트레이드오프로 남겨두기로 하고(`docs/decisions.md` §2), **테스트만** 발행 전에 `subscriber_read_model`이 실제로 동기화될 때까지 기다리도록 수정했다 — 테스트가 검증하려는 대상(Fan-out 로직)과 무관한 타이밍 문제로 테스트가 흔들리는 걸 막기 위함이다.
+
+**교훈**: 통합 테스트가 간헐적으로 실패할 때 무조건 재시도 로직이나 타임아웃을 늘려서 덮지 말고, 그 실패가 **테스트 인프라의 타이밍 문제인지 시스템 자체의 진짜 레이스 컨디션인지**부터 구분해야 한다. 이번 건 후자였고, 그 사실 자체가 나중에(§3.1) 실제 운영 리스크로 이어진다는 게 밝혀졌다.
+
+---
+
+### 2.2 전체 스위트 실행 시에만 실패하는 테스트
+
+**증상**: `SubscribeThenImmediatePublishIntegrationTest`를 단독으로 돌리면 거의 항상 통과하는데, `./gradlew test`로 전체 스위트를 돌리면 가끔 타임아웃으로 실패했다.
+
+**진단 과정**: 실패 로그를 보니 단순 타임아웃(`AssertionError: Timed out waiting for notifications`)이라 근본 원인을 알려주는 스택 트레이스가 없었다. "이 테스트만 실행하면 통과하는가?"를 먼저 확인했고, 5번 연속 실행 중 4번 통과 — 단독 실행 자체는 안정적이었다.
+
+**근본 원인**: 여러 테스트 클래스가 같은 `TestcontainersConfiguration`(따라서 같은 Kafka consumer group)을 공유하는데, 전체 스위트를 돌릴 때는 바로 앞 테스트 클래스가 막 컨슈머 그룹을 떠난 직후라 리밸런싱 오버헤드가 끼어들 수 있다 — 이 테스트가 원래 검증하려는 재시도 로직(~4초 예산)보다 이 오버헤드가 더 오래 걸리면 테스트 자체의 대기 시간이 부족해진다.
+
+**해결**: 프로덕션 코드(재시도 로직)는 그대로 두고, 테스트의 **외부 대기 시간**만 15초 → 30초로 늘렸다 — 테스트 인프라 특유의 잡음을 흡수하되, 프로덕션 재시도 예산(~4초)이라는 실제 동작 기준은 건드리지 않았다.
+
+**교훈**: "전체 스위트에서만 실패"는 대체로 테스트 간 공유 자원(컨슈머 그룹, DB 커넥션 풀, 포트 등) 경쟁을 의심할 신호다. 이럴 때 프로덕션 코드의 타임아웃/재시도 값을 손대는 대신, 테스트의 관찰 대기 시간만 넉넉하게 늘리는 편이 "실제 동작 기준"과 "테스트 안정성"을 분리해서 관리하기 좋다.
+
+---
+
+## 3. 장애 주입/부하 테스트로 발견한 실제 버그
+
+### 3.1 Read Model 동기화 레이스가 실제 알림 영구 유실로 이어짐
+
+**증상**: §2.1에서 "테스트에서만 보이는 레이스"로 넘겼던 문제가, 실제 장애 주입 테스트(Kafka 강제 종료 → 복구) 중 **진짜 데이터 유실**로 나타났다. 부하 테스트가 만들어둔 약 11,700건의 구독 이벤트 백로그가 있는 상태에서 Kafka를 내렸다 올렸더니, 그사이 새로 구독하고 발행한 글의 알림이 영영 생성되지 않았다.
+
+**진단 과정**:
+1. `post.outbox_events`/`subscription.subscription_outbox_events` 상태를 시간대별로 폴링하며 관찰.
+2. 우리 테스트용 구독 이벤트가 `PUBLISHED`되기까지 약 4분이 걸린 반면, `post.published`는 Kafka 복구 후 180ms 만에 발행된 걸 확인.
+3. 앱 로그에서 `SubscriptionOutboxRelay`가 `TimeoutException: Expiring 1 record(s) ... 120001ms has passed`를 던지는 걸 발견 — Kafka 재시작 직후 리더 재선출 등으로 개별 발행이 최대 120초까지 블로킹되고 있었다.
+4. `PostOutboxRelay`와 `SubscriptionOutboxRelay`가 Spring Boot 기본 설정상 **스케줄러 스레드 하나를 공유**한다는 걸 코드에서 확인 — 한쪽이 블로킹되면 다른 쪽도 밀린다.
+
+**근본 원인**: 세 가지 트레이드오프(§2의 Read Model 레이스, 동기 블로킹 발행, 스케줄러 스레드 공유)가 개별적으로는 감수할 만했지만, **동시에 겹치면서 레이스 윈도우가 밀리초에서 분 단위로 증폭**됐다.
+
+**해결**: 단계적으로 진행했다.
+1. `spring.task.scheduling.pool.size: 3`으로 스케줄러 스레드를 분리(가장 작은 변경).
+2. Fan-out 컨슈머에 짧은 재시도(최대 5회, ~4초)를 추가해 흔한 케이스를 흡수.
+3. Kafka 발행 자체를 비동기 콜백으로 전환해 백로그 처리 속도를 10배 이상 개선(70초 → 7초).
+
+**해결 안 됨 (진행 중)**: 3번까지 했는데도 대량 백로그 상황에서는 여전히 재현됐다 — 이번엔 컨슈머 쪽(Read Model 동기화 자체)이 병목이 되어 259초가 걸렸다. 근본 해결은 Fan-out/Read Model 동기화를 청크 단위로 병렬 처리하는 것(아직 미착수, `docs/decisions.md` §1)뿐이라는 결론에 도달했다.
+
+**교훈**: 이 사건 전체가 보여주는 건 "개별적으로 받아들인 트레이드오프들이 서로 독립적이라는 보장은 없다"는 것이다. 설계 문서에 각각 트레이드오프로 기록해뒀다고 안심할 게 아니라, **실제 부하/장애를 함께 걸어봐야만 그 트레이드오프들이 어떻게 상호작용하는지 드러난다**. 이번 케이스는 부하 테스트(백로그 생성)와 장애 주입(Kafka 재시작)을 같이 하지 않았다면 발견하지 못했을 문제다.
+
+---
+
+### 3.2 비동기 전환 중 직접 만든 회귀 — 중복 제출 폭주
+
+**증상**: §3.1의 해결책 3번(비동기 발행 전환)을 구현하고 검증하는 과정에서, 오히려 **더 심각한 문제**를 새로 만들었다. Kafka 장애 중 앱 로그에 `TimeoutException: Expiring ... record(s)`가 90,438건이나 쌓였다 — 원래 있던 문제(느린 발행)보다 훨씬 나쁜 형태(대량 타임아웃 폭주)로 재발했다.
+
+**진단 과정**: 로그에서 같은 이벤트 ID가 짧은 간격으로 반복 등장하는 걸 발견했다. 코드를 다시 보니, `.get()` 블로킹을 없애면서 `relay()` 메서드가 매초 즉시 반환하게 됐는데, **아직 ack이 안 돌아온 이벤트도 여전히 `PENDING` 상태이므로 다음 폴링에서 또 뽑혀서 다시 제출**되고 있었다. Kafka가 죽어있는 동안에는 어떤 시도도 완료되지 않으니, 100초가 넘는 장애 시간 동안 매초 같은 배치가 계속 쌓였다.
+
+**근본 원인**: 비동기로 전환하면서 "이미 보낸 건 다시 안 보낸다"는 상태 추적을 빠뜨렸다. 동기 코드에서는 `.get()`이 자연스럽게 이 역할(한 번에 하나씩만 시도)을 하고 있었는데, 그걸 없애면서 대체할 장치를 안 넣은 것이다.
+
+**해결**: 각 Relay에 `ConcurrentHashMap` 기반의 `inFlight` Set을 추가해, 아직 ack이 안 돌아온 이벤트 ID는 폴링 대상에서 제외하고, 콜백이 끝나면(성공이든 실패든) 다시 제외 목록에서 뺐다.
+
+**검증**: 같은 조건(약 7,610건 백로그)으로 재현했을 때 타임아웃 폭주 없이 정상적으로 처리되는 걸 확인했고, 이 상태로 백로그가 약 7초 만에 드레인되는 것까지 측정했다.
+
+**교훈**: 동기 코드를 비동기로 바꿀 때는 "동기 코드가 암묵적으로 보장하던 것"이 뭔지부터 따져봐야 한다 — 이 경우 `.get()`은 단순히 "느리다"뿐 아니라 "한 이벤트는 한 번에 하나의 시도만 진행 중"이라는 상태도 같이 보장하고 있었다. 그 암묵적 보장을 놓치면 비동기 전환이 문제를 고치는 게 아니라 다른 문제로 바꿔치기할 수 있다. 다행히 이번엔 배포 전 재현 테스트 단계에서 잡혔다 — **"고쳤다"고 결론 내리기 전에 같은 재현 시나리오로 다시 검증하는 절차**가 없었다면 그대로 넘어갈 뻔했다.
+
+---
+
+### 3.3 배치 리스너 전용 `ConsumerFactory`를 직접 만들었다가 Testcontainers 동적 포트를 우회함
+
+**증상**: `SubscriberSyncConsumer`를 배치 리스너로 전환한 뒤(§1 컨슈머 처리 속도 개선 작업), `PostPublishedFanoutIntegrationTest`/`SubscribeThenImmediatePublishIntegrationTest`가 `subscriber_read_model` 동기화를 기다리다 타임아웃으로 실패했다. `PostPublishedFanoutConsumer`(기존 단건 리스너)는 정상 동작했다.
+
+**진단 과정**: `--info` 로그를 켜고 배치 리스너 컨슈머(`consumer-subscriber-sync-*`)만 추적해보니 `partitions assigned` 로그가 아예 없고, 대신 `Connection to node -1 (localhost/127.0.0.1:9092) could not be established`가 반복됐다. `application.yml`의 고정 주소(`localhost:9092`)로 연결을 시도하고 있었다 — Testcontainers가 매 테스트마다 임의 포트로 띄우는 실제 브로커가 아니라.
+
+**근본 원인**: 배치 리스너 전용 `ConcurrentKafkaListenerContainerFactory`를 만들면서 `DefaultKafkaConsumerFactory(kafkaProperties.buildConsumerProperties())`로 `ConsumerFactory`를 직접 새로 구성했는데, 이 방식은 Spring Boot가 `@ServiceConnection`/`KafkaConnectionDetails`로 테스트용 동적 포트를 주입하는 자동설정 경로를 타지 않는다. 자동설정된 `ConsumerFactory`/`ProducerFactory`/`AdminClient` 빈들만 `KafkaConnectionDetails`를 우선 참조하도록 되어 있고, `KafkaProperties.getBootstrapServers()`를 직접 읽으면 `application.yml`에 적힌 값 그대로 쓰인다.
+
+**해결**: 새 `ConsumerFactory`를 직접 만드는 대신, 이미 올바르게(동적 포트 포함) 구성된 자동설정 `ConsumerFactory<String, String>` 빈을 주입받아 배치 리스너 팩토리에 그대로 재사용하도록 바꿨다.
+
+**교훈**: Spring Boot 자동설정이 제공하는 인프라 연결 빈(`ConsumerFactory`, `DataSource` 등)을 손으로 다시 만들 때는, 그 자동설정이 `@ServiceConnection` 같은 테스트/런타임 오버라이드 메커니즘과 어떻게 연결되어 있는지부터 확인해야 한다. "설정값(`KafkaProperties`)을 그대로 읽어서 새로 만들면 똑같이 동작하겠지"라는 가정이 이번엔 틀렸다 — 오버라이드는 설정값이 아니라 빈 생성 경로에 걸려 있었다.
+
+---
+
+### 3.4 컨슈머 concurrency를 올리자 §5-b(consumer group 공유)가 실제 장애로 드러남
+
+**증상**: 3.3을 고친 뒤에도 여전히 같은 두 테스트가 타임아웃으로 실패했다. `SubscriberSyncConsumer` 쪽 컨슈머(`consumer-subscriber-sync-2`~`7`)가 `subscription.changed`에 `Subscribed to topic(s)`까지는 찍히는데, 그 이후로 아무 로그도 없이 멈췄다.
+
+**진단 과정**: `decisions.md` §5-b에 이미 "`SubscriberSyncConsumer`와 `PostPublishedFanoutConsumer`가 같은 consumer group(`notification-system`)을 공유한다"는 게 미해결 이슈로 적혀 있었다는 걸 기억해내고, 리밸런싱 로그를 다시 살펴봤다. `Resetting generation ... Request joining group ... pro-actively leaving the group`이 여러 멤버에서 계속 반복되고 있었다 — 리밸런싱이 끝나지 않고 있었다.
+
+**근본 원인**: 두 리스너가 같은 그룹을 공유하는 것 자체는 이전에도(concurrency=1일 때) 문제없이 동작했지만, `subscription.changed` 쪽 concurrency를 6으로 올리면서 한 그룹 안에 "post.published만 구독하는 멤버 1개"와 "subscription.changed만 구독하는 멤버 6개"가 섞이게 됐다. 서로 다른 구독 목록을 가진 멤버가 늘어나면서 그룹 리밸런싱이 안정적으로 수렴하지 못했다.
+
+**해결**: `@KafkaListener(groupId = ...)`로 두 리스너의 그룹을 `subscriber-sync`/`post-fanout`으로 명시적으로 분리했다.
+
+**교훈**: 문서(`decisions.md`)에 "지금은 문제없이 동작하지만 잠재적 위험"이라고 적어둔 트레이드오프도, 주변 조건(이번엔 concurrency)이 바뀌면 잠재 위험에서 실제 장애로 넘어갈 수 있다. 관련 있는 다른 변경을 하기 전에 그 변경이 이미 알려진 미해결 이슈를 건드리지는 않는지 `decisions.md`를 먼저 훑어보는 습관이 있었다면 더 빨리 의심할 수 있었을 것이다.
+
+---
+
+## 4. Git / GitHub
+
+### 4.1 커밋은 쌓이는데 GitHub 컨트리뷰션 그래프(잔디)에 안 뜸
+
+**증상**: 로컬에서 여러 커밋을 만들고 push까지 했는데, GitHub 프로필의 컨트리뷰션 그래프에 아무것도 표시되지 않았다.
+
+**진단 과정**: 원인이 될 만한 후보를 하나씩 배제해나갔다.
+1. **날짜**: 커밋 날짜가 실제 오늘 날짜와 일치하는지 확인 — 일치했다(이 환경의 시스템 시계 자체가 실제 "오늘"이었다).
+2. **이메일 인증**: 최근 커밋의 이메일이 GitHub 계정에 등록/인증돼 있는지 확인 — Primary, Verified 상태였다.
+3. **계정 혼동 의심**: 사용자가 "다른 GitHub 계정으로 push된 것 아니냐"고 의심했다. Windows 자격 증명 관리자(`cmdkey /list`)를 확인해 push 인증이 실제로 올바른 계정으로 되고 있음을 확인 — 계정 문제는 아니었다.
+4. **레포 설정**: `api.github.com/repos/...`를 조회해 fork 여부, 기본 브랜치, 공개 여부를 확인 — fork 아님, public, 기본 브랜치도 push 대상과 일치.
+5. 여기까지 전부 정상인데도 안 뜬다는 사실 자체가 이상해서, `git log --all --pretty=format:'%h %ae %ad %s'`로 **전체 커밋의 이메일을 한 번에 나열**해봤다.
+
+**근본 원인**: 최근에 딱 하나의 로컬 커밋에서만 이메일을 인증된 주소로 바꿨을 뿐, **이미 push된 이전 커밋들은 전부 다른(미확인) 이메일**로 되어 있었다. 즉 "인증된 이메일 커밋"은 아직 push 전이었고, "이미 push된 커밋"은 인증 여부를 확인하지 않은 이메일이었던 것 — 두 사실을 따로따로 확인하느라 서로 다른 커밋을 보고 있다는 걸 놓쳤다.
+
+**해결**: 로컬 저장소 전용으로 `git config user.email`을 바꾼 뒤(전역 설정은 건드리지 않음), 그 설정으로 만든 최신 커밋을 push — 정상적으로 반영됐다.
+
+**교훈**: "설정을 바꿨다"와 "그 설정이 적용된 결과물이 실제로 존재한다"는 다른 얘기다. 특히 히스토리가 있는 저장소에서 설정을 바꾼 시점 이후의 상태만 확인하고 "이전 것도 당연히 그렇겠지"라고 넘겨짚으면, 이번처럼 진단이 계속 헛도는 원인이 된다. `git log`로 히스토리 전체를 한 번에 훑어보는 게 개별 항목을 하나씩 확인하는 것보다 이런 불일치를 훨씬 빨리 드러낸다.
+
+---
+
+## 요약 — 반복해서 유용했던 진단 습관
+
+| 습관 | 어디서 도움이 됐나 |
+|---|---|
+| 실패를 재현하기 전에 "단독 실행하면 통과하는가"부터 확인 | §2.2 — 인프라 flake와 진짜 회귀 구분 |
+| 타임스탬프/상태를 폴링하며 시간순으로 관찰 | §3.1 — 레이스의 실제 지속 시간 파악 |
+| "고쳤다"고 결론 내리기 전에 같은 재현 시나리오로 재검증 | §3.2 — 회귀를 배포 전에 잡음 |
+| 개별 항목이 아니라 전체 목록을 한 번에 조회 | §4.1 — 설정 변경 시점의 불일치 발견 |
+| 확실하지 않으면 검색보다 실제 아티팩트(jar, API 응답)를 직접 까서 확인 | §1.3 — 프레임워크 패키지 이동 확인 |

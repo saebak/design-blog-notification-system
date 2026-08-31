@@ -91,15 +91,15 @@ flowchart TB
 
 | 구성 요소 | 선택 | 근거 |
 |---|---|---|
-| Language/Runtime | **Kotlin** (JVM) | 코루틴 기반 비동기 처리로 Kafka 컨슈머/청크 워커의 동시성 코드를 Java보다 간결하게 표현할 수 있고, JVM 생태계(Kafka/PostgreSQL/Redis 클라이언트 성숙도)를 그대로 활용할 수 있어 이 아키텍처와 궁합이 좋다. 이직 대상 시장(백엔드)에서 JVM 언어 경험이 여전히 표준적으로 요구된다는 점도 고려했다. |
-| Backend Framework | **Spring Boot** (Spring Kafka, Spring Data JDBC, Spring WebFlux/STOMP) | Kafka 컨슈머 그룹, 트랜잭셔널 아웃박스(Outbox Relay), WebSocket을 각각 별도 라이브러리 조합 없이 1급 지원. 채용 시장 인지도가 가장 높아 포트폴리오로서의 검증 가능성도 크다. |
+| Language/Runtime | **Kotlin** (JVM) | 코루틴 기반 비동기 처리로 Kafka 컨슈머/청크 워커의 동시성 코드를 Java보다 간결하게 표현할 수 있고, JVM 생태계(Kafka/PostgreSQL/Redis 클라이언트 성숙도)를 그대로 활용할 수 있어 이 아키텍처와 궁합이 좋다. |
+| Backend Framework | **Spring Boot** (Spring Kafka, Spring Data JDBC, Spring WebFlux/STOMP) | Kafka 컨슈머 그룹, 트랜잭셔널 아웃박스(Outbox Relay), WebSocket을 각각 별도 라이브러리 조합 없이 1급 지원. |
 | DB 배포 토폴로지 | 단일 PostgreSQL 인스턴스, Context별 스키마로 논리 분리 | Bounded Context 분리(코드 경계)와 물리 배포는 별개 문제. 인스턴스를 여러 개 운영하는 인프라 복잡도는 불필요하다고 판단, 모듈러 모놀리식으로 시작(`database-design.md` §0). 대신 DB 인스턴스 자체가 공동 장애점(SPOF)이 된다는 트레이드오프는 수용한다(§8 NFR-2 참고). |
 | 메시지 브로커 | Kafka | 파티션 기반 컨슈머 그룹으로 수평 확장이 쉽고(NFR-3.2), 처리량 목표(20k msg/sec)에 맞는 처리량/내구성 검증된 선택지. 재시도용 DLQ 토픽 구성도 자연스럽다. |
 | Outbox Relay | DB 폴링 또는 CDC(Debezium) | NFR-2.2 — 브로커 장애 시에도 글 등록 트랜잭션은 커밋되어야 하므로, 이벤트 발행을 트랜잭션 밖의 별도 프로세스로 완전히 분리. |
 | Notification 저장소 | RDB(쓰기 정합성) + 읽기 캐시(Redis, unread count) | 알림 생성은 멱등성 unique 제약(`domain-design.md` §5.2)이 필요해 RDB가 유리하고, unread count 같은 고빈도 조회는 캐시로 분리해 Read Path를 발송 파이프라인과 격리(NFR-2.3). |
 | 실시간 채널 | WebSocket + Redis Pub/Sub(다중 인스턴스 브로드캐스트) | Notification 서버가 여러 인스턴스로 수평 확장될 것이므로, 특정 사용자가 어느 인스턴스에 연결돼 있는지 모른 채로도 이벤트를 전파해야 함. |
 | Push/Email 게이트웨이 | 목업 인터페이스(Port) | FR-4.1/4.2, 요구사항 범위상 실연동은 Out of Scope. |
-| Infra/Deploy | Docker Compose (Kafka, PostgreSQL, Redis, 앱 다중 인스턴스를 로컬에서 함께 구동) | 포트폴리오 스코프에서는 단일 머신에서 전체 파이프라인을 재현 가능한 것이 우선이고, k8s 수준의 오케스트레이션은 이 프로젝트의 검증 목표(NFR 충족 여부)에 필수적이지 않다고 판단. 여유가 되면 k8s manifest를 확장 예시로 추가하는 정도로 스트레치 골 처리. |
+| Infra/Deploy | Docker Compose (Kafka, PostgreSQL, Redis, 앱 다중 인스턴스를 로컬에서 함께 구동) | 지금 스코프에서는 단일 머신에서 전체 파이프라인을 재현 가능한 것이 우선이고, k8s 수준의 오케스트레이션은 이 프로젝트의 검증 목표(NFR 충족 여부)에 필수적이지 않다고 판단. 여유가 되면 k8s manifest를 확장 예시로 추가한다. |
 | Load Test | k6 | JS 기반 스크립팅으로 HTTP API(구독, 글 등록)와 WebSocket 시나리오를 함께 작성하기 Locust보다 간결하고, Grafana 연동이 쉬워 NFR-1.4(부하 테스트 결과 문서화)와 §4.4의 관측 지표를 같은 대시보드에서 볼 수 있다. |
 
 ---

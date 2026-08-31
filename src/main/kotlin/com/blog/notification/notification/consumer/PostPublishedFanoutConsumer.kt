@@ -10,13 +10,12 @@ import com.blog.notification.user.NotificationChannel
 import com.blog.notification.user.repository.UserRepository
 import org.slf4j.LoggerFactory
 import org.springframework.kafka.annotation.KafkaListener
-import org.springframework.stereotype.Component
 import tools.jackson.databind.ObjectMapper
 
 // post.published를 소비해 구독자 중 Mute가 아닌 사용자에게 알림을 생성한다.
 // 청크 분산 없이 단일 컨슈머가 한 번에 처리하는 단순 버전 — 대량 트래픽 대응(Dispatcher/Chunk Worker
 // 분리)은 스코프 밖, docs/architecture.md §4 참고.
-@Component
+// Retained for the legacy single-consumer implementation; FanoutDispatcher/ChunkWorker are now active.
 class PostPublishedFanoutConsumer(
     private val subscriberReadModelDao: SubscriberReadModelJdbcDao,
     private val userRepository: UserRepository,
@@ -26,7 +25,7 @@ class PostPublishedFanoutConsumer(
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
 
-    @KafkaListener(topics = [KafkaTopics.POST_PUBLISHED])
+    @KafkaListener(topics = [KafkaTopics.POST_PUBLISHED], groupId = "post-fanout")
     fun onMessage(payload: String) {
         val message = objectMapper.readValue(payload, PostPublishedMessage::class.java)
         val subscriberIds = findSubscribersWithRetry(message.authorId)
