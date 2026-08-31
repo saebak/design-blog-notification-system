@@ -61,4 +61,18 @@ class SubscriberReadModelJdbcDao(
         return jdbcTemplate.queryForList(sql, MapSqlParameterSource("authorId", authorId), Long::class.java)
             .filterNotNull()
     }
+
+    fun findUserIdsByAuthorAfter(authorId: Long, cursorUserId: Long?, limit: Int): List<Long> {
+        val sql = """
+            SELECT user_id FROM notification.subscriber_read_model
+            WHERE author_id = :authorId AND user_id > :cursorUserId
+            ORDER BY user_id LIMIT :limit
+        """.trimIndent()
+        return jdbcTemplate.queryForList(
+            sql,
+            MapSqlParameterSource("authorId", authorId)
+                .addValue("cursorUserId", cursorUserId ?: 0L).addValue("limit", limit),
+            Long::class.java,
+        ).filterNotNull()
+    }
 }

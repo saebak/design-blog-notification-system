@@ -18,4 +18,8 @@ class KafkaTopicConfig {
     @Bean
     fun subscriptionChangedTopic(): NewTopic =
         TopicBuilder.name(KafkaTopics.SUBSCRIPTION_CHANGED).partitions(6).replicas(1).build()
+
+    @Bean
+    fun fanoutChunkRequestedTopic(): NewTopic =
+        TopicBuilder.name(KafkaTopics.FANOUT_CHUNK_REQUESTED).partitions(32).replicas(1).build()
 }
