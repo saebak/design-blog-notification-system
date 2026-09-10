@@ -2,6 +2,8 @@
 
 > [`requirements.md`](./requirements.md)의 FR/NFR을 기반으로 도메인을 3개의 Bounded Context로 분리한다. 각 Context는 독립된 라이프사이클과 논리적으로 분리된 데이터 저장소(스키마)를 가지며, 나중에 서로 다른 팀/서비스가 소유할 수 있다는 가정 하에 설계한다 — 단, 이는 코드/모듈 경계에 대한 가정이지 물리 배포 토폴로지에 대한 가정은 아니다. 실제 구현은 단일 레포/단일 DB 인스턴스의 모놀리식으로 시작하고, 모듈 경계(스키마 경계)만 Context 경계와 일치시킨다 (`database-design.md` §0). 이렇게 해두면 나중에 특정 Context의 부하가 커졌을 때 그 스키마만 별도 서비스/DB로 분리해낼 수 있다.
 
+> **현행 기준(2026-09-10)**: Notification Context는 `FanoutDispatcher`/`FanoutChunkWorker`, `fanout_dispatches` 실행 저널, DB 폴링 Push Worker와 claim lease까지 구현됐다. Email 발송, WebSocket/SSE, 인증·권한, 발행 시점의 정확한 구독 스냅샷은 확장 설계다.
+
 ## 1. Context 분리 기준
 
 | Context | 책임 | 변경 이유 (Reason to change) |
@@ -169,24 +171,25 @@ Fan-out은 `authorId`로 이 테이블을 청크 단위(FR-2.4)로 스캔한다.
 - `NotificationList.markAllAsRead(recipientId)` (도메인 서비스 or 애플리케이션 서비스에서 벌크 처리)
 
 ### 5.3 Entity: `DeliveryAttempt` (채널별 발송 이력)
-`Notification` 1건당 채널(Push/Email)별로 0~N개 생성 (Mute면 0개). 물리 테이블은 `notification_delivery_log`(`database-design.md` §4.3)이다 — Entity 이름이 "시도(Attempt)"인 이유는 재시도 여부를, 테이블 이름이 "로그(log)"인 이유는 채널별 발송 이력이 시간순으로 누적되는 성격을 강조하기 위함이며, 가리키는 데이터는 동일하다.
+현재는 `Notification` 1건당 Push 채널 발송 행을 최대 1개 생성한다(Mute 또는 Email 설정이면 Push 발송 행 없음). 물리 테이블은 `notification_delivery_log`(`database-design.md` §4.3)다. Email 채널별 발송 이력은 확장 구현 시 같은 모델을 확장한다.
 | 필드 | 타입 | 설명 |
 |---|---|---|
 | notificationId | FK | 연관 알림 |
-| channel | Push \| Email | 채널 |
-| status | Pending/Sent/Failed/DeadLetter | 상태 (FR-4.3, 4.4) |
+| channel | Push (Email은 확장) | 채널 |
+| status | Pending/Processing/Sent/Failed/DeadLetter | 상태 (FR-4.3, 4.4) |
 | attemptCount | Int | 재시도 횟수 |
 | lastAttemptAt | DateTime | 마지막 시도 시각 |
+| claimToken / claimedUntil | UUID / DateTime | 다중 워커 claim 소유권과 lease 만료 시각 |
 
 ### 5.4 Fan-out 프로세스 (Application Service, Aggregate 아님)
 `PostPublished` 이벤트를 소비하는 애플리케이션 서비스. 이 도메인 문서에서는 하나의 서비스로 추상화해 서술하지만, 실제 구현(`architecture.md` §4)에서는 성능상의 이유로 **Dispatcher**(구독자를 스캔해 청크로 쪼개는 역할)와 **Chunk Worker**(청크 하나를 실제로 처리하는 역할) 두 컴포넌트로 나뉜다. 아래 흐름의 1~2단계는 Dispatcher가, 3~5단계는 Chunk Worker가 맡는다.
 1. `eventId` 기준 처리 이력 확인 (재처리 시 멱등 — 이미 처리된 이벤트면 skip).
 2. `Subscriber Read Model`에서 `authorId` 기준 구독자를 청크 단위로 스캔.
 3. 청크별로 §6의 공유 `users` 테이블에서 `notification_channel` 조회 → `Mute` 제외 (FR-3.3).
-4. `Notification` 생성(벌크 insert) + 채널별 `DeliveryAttempt` 생성.
-5. `DeliveryAttempt`를 Push/Email 발송 큐에 적재.
+4. `Notification` 생성(벌크 insert) + Push 대상의 `DeliveryAttempt` 생성.
+5. Push Worker가 DB에서 `PENDING` 또는 만료된 `PROCESSING` 행을 claim해 발송한다. Email 발송 큐는 확장 범위다.
 
-> 이 프로세스의 진행 상태(총 대상자 수, 처리된 수, SLA 준수 여부)는 NFR-4.1(관측성) 대응이 필요하지만, 별도 DB 보조 레코드(`FanoutProgress`)로 두지 않는다 — Dispatcher/Chunk Worker가 각자 카운터·타이머 메트릭(청크 분배 수, 청크 처리 완료 수, 처리 소요 시간)을 노출하고 `eventId`를 공통 라벨/트레이스 ID로 붙여 상관관계를 추적한다. DB에 진행 상태 행을 두면 다수 워커가 같은 행을 동시에 갱신하는 쓰기 경합(hot row)이 생겨, 정작 이 관측이 지키려는 5초 SLA(NFR-1)의 발목을 잡을 수 있기 때문. 자세한 내용은 `architecture.md` §4.4 참고.
+> Dispatcher의 재시작 안전성과 운영 복구를 위해 `fanout_dispatches`에 event ID별 cursor, 다음 청크 번호, 상태, 재시도 횟수/시각을 저장한다. Prometheus에는 event ID 같은 고 cardinality 라벨 없이 상태별 gauge와 전역 counter를 노출한다. 자세한 지표와 복구 절차는 [`operations.md`](./operations.md)를 따른다.
 
 ### Repository / Port
 - `NotificationRepository.bulkSave(notifications)`
@@ -194,7 +197,8 @@ Fan-out은 `authorId`로 이 테이블을 청크 단위(FR-2.4)로 스캔한다.
 - `NotificationRepository.countUnread(userId)` (FR-5.3)
 - `DeliveryAttemptRepository.save/updateStatus`
 - `UserRepository.findChannelByIds(userIds)` — Fan-out 시 Mute 필터링용 벌크 조회 (§6의 공유 `users` 테이블)
-- `PushGatewayPort` / `EmailGatewayPort` — 외부 발송기 인터페이스 (구현은 목업, FR-4.1/4.2)
+- `PushGatewayPort` — 외부 Push 서버 위임 인터페이스(현재는 시뮬레이션 구현)
+- `EmailGatewayPort` — 확장 설계
 
 ---
 
@@ -216,8 +220,9 @@ Fan-out은 `authorId`로 이 테이블을 청크 단위(FR-2.4)로 스캔한다.
 |---|---|---|
 | Post → Notification | 비동기 이벤트 (Outbox + Broker) | `PostPublished` |
 | Subscription → Notification | 비동기 이벤트 | `SubscriptionChanged` |
-| Notification 내부 (Fan-out → Push/Email 발송기) | 비동기 큐 | `DeliveryRequested` (per-channel) |
-| Notification → 클라이언트(웹/앱) | 실시간 채널(WebSocket/SSE) + 폴백 목록 조회 | `NotificationCreated` (push to connected clients) |
+| Notification 내부 (Fan-out → Push) | PostgreSQL 작업 큐 + claim lease | `notification_delivery_log` |
+| Notification 내부 (Fan-out → Email) | 확장 설계: 독립 비동기 큐 | `DeliveryRequested` |
+| Notification → 클라이언트(웹/앱) | 현재 읽음 처리 API, 실시간 채널은 확장 설계 | `NotificationCreated` (확장) |
 
 세 Context 모두 **동기 API 호출로 직접 결합되지 않는다** — 이것이 NFR-2(고가용성)를 도메인 설계 레벨에서 보장하는 핵심 장치다.
 
@@ -225,6 +230,7 @@ Fan-out은 `authorId`로 이 테이블을 청크 단위(FR-2.4)로 스캔한다.
 
 ## 8. 다음 단계
 
-- 각 Context의 DB 스키마/파티셔닝 전략 → `docs/architecture.md`
-- 메시지 브로커 토픽/파티션 키 설계 (예: `PostPublished`는 `authorId` 기준 파티셔닝 고려 — Hot Partition 이슈, NFR-3.3)
-- Fan-out 청크 크기 및 워커 동시성 설계 → NFR-1.3 처리량 목표(20,000 msg/sec)와 연결
+- 현행 스키마와 파티션/동시성 설정은 [`architecture.md`](./architecture.md), [`database-design.md`](./database-design.md)를 기준으로 유지한다.
+- 우선순위 1: 현행 Dispatcher/Chunk Worker 구조로 10만 명/5초 부하 테스트를 다시 실행한다.
+- 우선순위 2: 운영 지표와 수동 복구 API를 실제 운영 환경의 인증·감사 체계에 연결한다.
+- 확장 구현: 정확한 발행 시점 구독 스냅샷, 인증/RBAC, Email, WebSocket/SSE.

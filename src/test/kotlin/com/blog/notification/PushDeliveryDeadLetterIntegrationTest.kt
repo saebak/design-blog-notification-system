@@ -26,7 +26,7 @@ class PushDeliveryDeadLetterIntegrationTest {
     class AlwaysFailingPushGatewayConfig {
         @Bean
         @Primary
-        fun alwaysFailingPushGatewayPort(): PushGatewayPort = PushGatewayPort { _, _ -> false }
+        fun alwaysFailingPushGatewayPort(): PushGatewayPort = PushGatewayPort { _, _, _ -> false }
     }
 
     @Autowired

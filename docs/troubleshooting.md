@@ -2,6 +2,8 @@
 
 > `docs/decisions.md`가 "무엇을 스코프에서 뺐고 왜 뺐는지"를 다루는 문서라면, 이 문서는 **실제로 겪은 문제와 그걸 어떻게 진단해서 해결했는지**를 다룬다. 설계 단계에서 예상한 트레이드오프가 아니라, 구현/테스트/배포 과정에서 부딪힌 구체적인 사건들의 기록이다. 각 항목은 증상 → 진단 과정 → 근본 원인 → 해결 → 교훈 순으로 적는다.
 
+> **현행 참고(2026-09-10)**: 아래 단일 `PostPublishedFanoutConsumer`, `post-fanout` 그룹, 스케줄러 풀 3 관련 표현은 당시 장애 재현 기록이다. 현재는 Dispatcher/Chunk Worker, `fanout-dispatcher` 그룹, 영속 재시도/membership gate, 스케줄러 풀 4로 대체됐으며 최신 운영 절차는 [`operations.md`](./operations.md)를 따른다.
+
 ---
 
 ## 1. 로컬 개발 환경 문제

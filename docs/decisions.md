@@ -2,9 +2,22 @@
 
 > Post 발행 → 구독자 알림 생성(Outbox + Relay + Fan-out) 1차 구현 과정에서 스코프를 좁히며 내린 선택들과, 아직 결정되지 않은 채 남겨둔 사항들을 정리한다. `docs/architecture.md`/`domain-design.md`가 "최종 목표 아키텍처"를 그린 문서라면, 이 문서는 "지금 무엇을 미뤘고 왜 미뤘는지"를 추적하는 문서다. 각 항목은 다시 논의되어야 할 시점(트리거)을 함께 적는다.
 
-## 1. Fan-out을 청크로 분산하지 않고 단일 컨슈머가 전체 처리
+## 2026-09-10 현재 구현 상태
 
-- **현재 구현**: `PostPublishedFanoutConsumer` 하나가 `post.published` 메시지 1건당 구독자 전체를 조회해 한 번에 처리한다.
+- 기존 단일 `PostPublishedFanoutConsumer`는 `FanoutDispatcher`와 `FanoutChunkWorker` 구조로 대체됐다. Dispatcher는 구독자를 1,000명씩 키셋 조회하여 32개 파티션의 `fanout.chunk.requested` 토픽으로 보내고, 워커는 6개 동시성으로 처리한다.
+- `fanout_dispatches`에 커서, 다음 청크 번호, 재시도 시각과 횟수를 저장한다. Read Model이 비어 있으면 메모리 안에서 잠깐 재시도하고 포기하지 않고 `WAITING_RETRY`로 남겨 스케줄러가 복구한다. 최대 재시도 후에는 `FAILED`로 남아 운영자가 식별할 수 있다.
+- 같은 글의 동시 발행은 `DRAFT -> PUBLISHED` 조건부 갱신으로 단 한 요청만 승리하므로 `PostPublished` Outbox 이벤트가 중복 생성되지 않는다.
+- Push 발송 로그는 `PROCESSING` 상태, claim token, lease를 이용해 여러 인스턴스가 같은 건을 동시에 발송하지 않도록 claim한다. 만료된 claim은 다른 워커가 회수할 수 있다.
+- 초기 Read Model 백필은 opt-in 배치로 구현돼 있다. 이 문서 아래의 과거 기록과 부하/장애 보고서는 의사결정 이력 및 이전 구현 기준선으로 보존하며, 최신 구조의 성능 수치는 재측정 전이다.
+- Read Model 준비 조건 보완: Dispatcher는 첫 청크를 발행하기 전에 원본 ACTIVE 구독 집합과 Read Model 집합이 양방향으로 일치하는지 확인한다. 비어 있거나 일부만 반영된 경우 모두 영속 재시도로 넘기며, 진짜 구독자 0명인 경우에는 정상 완료한다. 다만 스캔이 시작된 뒤 새로 발생하는 구독/취소는 장기 스냅샷으로 고정하지 않고 기존 eventual-consistency 의미를 따른다.
+- **확장 구현으로 보류**: 발행 시점의 정확한 snapshot/watermark, 인증·인가, Email 채널, 사용자용 기능은 현재 안정성 작업과 분리해 `operations.md`의 백로그로 관리한다.
+
+> **현재 상태 갱신(2026-09-09)**: 아래의 2026-08 기록은 의사결정 이력으로 보존한다. 이후 `FanoutDispatcher`가 구독자를 1,000명씩 키셋 조회해 `fanout.chunk.requested`로 분산하고, `FanoutChunkWorker`가 처리하는 구조를 구현했다. Dispatcher 진행 상태와 지수 백오프 재시도는 DB에 영속화되며 재시작 후에도 이어진다. Push 발송은 lease/token 기반 `FOR UPDATE SKIP LOCKED` 클레임으로 다중 인스턴스 중복 처리를 막았다. 글 발행도 `DRAFT → PUBLISHED` 조건부 갱신으로 동시 요청에서 Outbox 이벤트가 한 번만 생성된다. 다만 Read Model이 **일부만** 반영된 순간의 완전한 스냅샷 일관성은 아직 보장하지 않으며, 최신 구조의 부하/장애 수치는 재측정 전이다.
+
+## 1. [과거 결정 기록] Fan-out을 청크로 분산하지 않고 단일 컨슈머가 전체 처리
+
+- **당시 구현(2026-08)**: `PostPublishedFanoutConsumer` 하나가 `post.published` 메시지 1건당 구독자 전체를 조회해 한 번에 처리했다.
+- **현재 결론(2026-09-10)**: 실측 병목을 근거로 단일 Consumer를 제거하고 `FanoutDispatcher`/`FanoutChunkWorker`로 전환해 이 결정은 종료됐다.
 - **원래 설계(`architecture.md` §4)**: Dispatcher가 구독자를 1,000명 단위 청크로 쪼개 `fanout.chunk.requested`에 발행하고, 여러 Chunk Worker가 병렬로 처리 — NFR-1(10만 명/5초) 충족을 위한 핵심 장치.
 - **트레이드오프**: 단일 컨슈머 방식은 구현이 단순하고 정확성 검증이 쉽지만, 인기 작가 팬아웃이 파티션 1개·컨슈머 1개에 몰려 순차 처리된다 — 대량 트래픽에서는 SLA를 못 지킨다(§0 참고).
 - **결정 필요 시점**: 부하 테스트(`docs/test/load-test-plan.md`)로 현재 구현의 처리량 한계를 실측한 뒤, 그 수치가 NFR-1 목표에 못 미치면 청크 Dispatcher/Worker 분리로 전환한다.
@@ -16,9 +29,11 @@
   - **남은 부분**: `PostPublishedFanoutConsumer` 자체의 청크 분산(Dispatcher/Chunk Worker, `architecture.md` §4)은 여전히 미착수 — 이번 조치는 §1 중 "컨슈머 처리 속도" 부분만 다뤘다.
 - **[2026-08-28 재현 검증 완료]**: §1.3과 동일 조건(k6로 백로그 생성 → Kafka 다운 중 테스트 신호 삽입 → 복구 후 측정)으로 재현했다(`chaos-test-report.md` §1.4). 이번 백로그(12,156건)는 §1.3(7,610건)보다 컸는데도 `subscriber_read_model` 반영 시간이 **259초 → 41.7초**로 줄었다(처리량 약 10배, 29.4→291 msg/sec). Outbox 드레인 시간(43.1초)과 read model 반영 시간(41.7초) 사이의 간극도 252초 → 1.4초로 사실상 사라졌다 — §4(비동기 발행)가 만든 처리량과 §1(배치 컨슈머)이 만든 처리량이 이제 거의 나란히 간다. **다만 Fan-out 재시도 예산(~4초, 실측 12.0초)은 여전히 41.7초보다 훨씬 짧아 이번에도 알림은 영구 유실됐다** — 개선 폭은 크지만 이 정도 백로그(1만 건 이상)에서는 §2를 완전히 닫지 못한다. 또한 이번 워크로드(k6 스크립트가 작가 1명만 반복 구독/해지)는 `subscription.changed`의 파티션 키(`authorId`) 특성상 이벤트가 전부 파티션 1개에 몰려, 관측된 개선이 파티션 병렬성이 아니라 배치 커밋(메시지당 1커밋 → 배치당 1커밋) 효과일 가능성이 높다는 한계도 함께 남겼다.
 
-## 2. `subscriber_read_model` 동기화와 Fan-out 사이의 최종적 일관성(eventual consistency)
+## 2. [과거 결정 기록] `subscriber_read_model` 동기화와 Fan-out 사이의 최종적 일관성(eventual consistency)
 
-- **현재 구현**: `subscription.changed`(Read Model 동기화)와 `post.published`(Fan-out)는 서로 독립된 비동기 파이프라인이라 처리 순서를 보장하지 않는다. 구독 직후 곧바로 글을 발행하면, Read Model이 아직 갱신되기 전에 Fan-out이 먼저 실행돼 그 구독자가 알림 대상에서 누락될 수 있다.
+> **현재 결론(2026-09-10)**: Dispatcher가 첫 청크 전에 원본 ACTIVE 구독과 Read Model의 양방향 일치를 확인하고, 불일치하면 `WAITING_RETRY`로 영속 재시도한다. 대량 백로그에서도 포기 후 유실되는 문제는 자동 테스트로 닫았다. 스캔 시작 뒤 변경까지 고정하는 정확한 발행 시점 snapshot/watermark는 확장 구현이다.
+
+- **당시 구현(2026-08)**: `subscription.changed`(Read Model 동기화)와 `post.published`(Fan-out)는 서로 독립된 비동기 파이프라인이라 처리 순서를 보장하지 않았다. 구독 직후 곧바로 글을 발행하면 Read Model이 아직 갱신되기 전에 Fan-out이 먼저 실행돼 알림 대상에서 누락될 수 있었다.
 - **검증된 사실**: `PostPublishedFanoutIntegrationTest`에서 실제로 이 레이스로 인한 실패를 재현했다(구독 직후 발행 시 간헐적으로 알림 누락). 운영 시나리오에서는 구독과 발행 사이 간격이 보통 이 갭보다 훨씬 크므로 실질적 영향은 낮다고 보고 테스트만 수정(발행 전 Read Model 동기화 완료를 기다리도록)하고 프로덕션 코드는 그대로 두었다.
 - **트레이드오프**: 이 갭을 없애려면 Fan-out이 Read Model 대신 Subscription 원본을 동기 조회하거나, Post 발행을 Read Model 동기화 완료 후로 지연시켜야 하는데, 둘 다 `domain-design.md` §2가 의도적으로 피한 "Context 간 동기 결합"을 다시 끌어들인다.
 - **결정 필요 시점**: "구독 직후 즉시 발행" 같은 실사용 패턴이 실제로 발생하는지 확인되면(예: 작가가 막 구독자를 얻고 바로 공지를 올리는 경우), 허용 가능한 지연 SLA를 정하고 그에 맞는 보완책(예: Fan-out 재시도/지연 처리)을 설계한다. 지금은 "받아들이는 트레이드오프"로 문서화만 해둔다.
@@ -29,16 +44,16 @@
 - **[2026-08-25 §4 조치 후 재재현]**: §4(비동기 발행)를 고친 뒤 다시 재현했다 — Outbox→Kafka 구간은 7초로 크게 빨라졌지만, 그 다음 컨슈머가 백로그를 처리해 Read Model에 반영하는 데 약 259초가 걸려 재시도 예산을 훨씬 초과했고, 알림은 또 유실됐다(`docs/test/chaos-test-report.md` §1.3). §4는 필요조건이었지만 충분조건은 아니었다 — §1(단일 컨슈머)까지 고쳐야 대량 백로그 상황에서도 이 레이스가 실질적으로 닫힌다.
 - **[2026-08-28 §1 부분 조치 후 재재현]**: §1의 `SubscriberSyncConsumer` 배치 전환을 고친 뒤 다시 재현했다(`chaos-test-report.md` §1.4) — Read Model 반영 시간이 259초 → 41.7초로 크게 줄었고, Outbox 드레인(43.1초)과의 격차도 사실상 사라졌다. 그런데도 **Fan-out 재시도 예산(~4초)이 41.7초보다 훨씬 짧아 알림은 또 유실됐다**. §1의 부분 조치는 필요조건이었지만 이번에도 충분조건은 아니었다 — 1만 건 이상 백로그에서 이 레이스를 완전히 닫으려면 재시도 예산 확장 또는 `architecture.md` §4의 Dispatcher/Chunk Worker 같은 구조적 변경이 필요하다.
 
-## 3. Outbox Relay 실패 처리 — 무한 재시도, Dead Letter 없음
+## 3. [과거 결정 기록] Outbox Relay 실패 처리 — 무한 재시도, Dead Letter 없음
 
-- **현재 구현**: Kafka 발행이 실패해도 `outbox_events.status`를 바꾸지 않는다 — 다음 폴링(1초 간격)에서 같은 이벤트를 자동으로 다시 시도한다. 최대 재시도 횟수나 `FAILED`/Dead Letter 상태는 없다.
+- **당시 및 현재 정책**: Kafka 발행이 실패해도 `outbox_events.status`를 바꾸지 않고 다음 폴링에서 같은 이벤트를 다시 시도한다. Outbox에는 최대 재시도 횟수나 `FAILED`/Dead Letter 상태를 두지 않는다.
 - **트레이드오프**: 구현이 단순하고 "이벤트를 영구히 잃어버리는" 실수를 원천 차단하지만, 브로커가 장기간 죽어 있으면 같은 이벤트를 계속 재시도하며 로그만 쌓인다 — 잘못된 payload(포이즌 메시지)로 인한 영구 실패도 동일하게 무한 재시도된다.
 - **결정 필요 시점**: 운영 관측(메트릭/알림)이 붙기 전까지는 무해하지만, 실제 장애 주입 테스트(`docs/test/chaos-test-plan.md`)를 실행할 때 이 부분이 "재시도 폭주"로 보이는지 확인하고, 필요하면 재시도 횟수 상한 + Dead Letter 컬럼을 추가한다.
 - **[2026-08-21 실측 갱신]**: 장애 주입 테스트(`docs/test/chaos-test-report.md` §1)에서 Kafka를 내렸다 올렸을 때 약 11,700건의 백로그가 재시도 폭주 없이(로그만 남기고) 결국 전량 발행되는 것을 확인했다 — 이 설계가 의도한 대로 동작했다. 다만 그 과정에서 개별 발행이 최대 120초까지 블로킹되는 부작용이 §4/§5와 겹쳐 §2의 알림 유실로 이어졌다(별개 이슈, §4 참고).
 
-## 4. Kafka 발행을 Relay 루프 안에서 동기 블로킹(`send().get()`)으로 처리
+## 4. [과거 결정 기록] Kafka 발행을 Relay 루프 안에서 동기 블로킹(`send().get()`)으로 처리
 
-- **현재 구현**: `PostOutboxRelay`/`SubscriptionOutboxRelay`가 이벤트를 하나씩 순회하며 `kafkaTemplate.send(...).get()`으로 ack까지 기다린 뒤 다음 이벤트로 넘어간다.
+- **당시 구현(2026-08)**: `PostOutboxRelay`/`SubscriptionOutboxRelay`가 이벤트를 하나씩 순회하며 `kafkaTemplate.send(...).get()`으로 ack까지 기다린 뒤 다음 이벤트로 넘어갔다.
 - **트레이드오프**: 순서 보장과 실패 처리(상태 롤백 없이 다음 폴링 재시도)가 단순해지지만, 이벤트 건수가 많아지면 배치 하나(현재 500건)를 처리하는 데 걸리는 시간이 늘어나 relay 폴링 주기(1초)를 못 맞출 수 있다.
 - **결정 필요 시점**: 부하 테스트에서 outbox 적체(backlog)가 관찰되면, 비동기 콜백 기반 발행 + 배치 단위 상태 업데이트로 전환한다.
 - **[2026-08-21 실측 갱신]**: 부하 테스트(시나리오 C)가 만든 약 11,700건의 outbox 백로그를 장애 주입 테스트 중 처리하면서, Kafka 복구 직후 리더 재선출 등으로 개별 `.send().get()` 호출이 최대 120초(`request.timeout.ms`/`delivery.timeout.ms` 기본값)까지 블로킹되는 것을 실제로 관측했다(`docs/test/chaos-test-report.md` §1.1). 이 블로킹이 §5(공유 스케줄러)와 겹쳐 다른 이벤트의 발행을 지연시켰고, 결국 §2의 알림 영구 유실로 이어졌다 — "outbox 적체가 관찰되면"이라는 트리거가 실제로 발생했다.
@@ -46,9 +61,11 @@
   - **개선 확인**: 같은 조건(약 7,610건 백로그, Kafka 다운→복구)으로 재현했을 때, subscription outbox가 전부 `PENDING`→`PUBLISHED`로 드레인되는 데 걸린 시간이 **약 70~240초 → 약 7초**로 단축됐다(`docs/test/chaos-test-report.md` §1.3). Relay 자체의 처리량 문제는 확실히 해결됐다.
   - **예상 밖의 발견 — 병목이 컨슈머 쪽으로 이동**: relay가 Kafka에 메시지를 다 밀어넣는 데는 7초밖에 안 걸렸지만, 그 뒤 `SubscriberSyncConsumer`가 쌓여있는 메시지를 순서대로(단일 컨슈머, §1) 소비해 `subscriber_read_model`에 반영하는 데는 여전히 **약 259초**가 걸렸다 — 그 사이 Fan-out 재시도 예산(§2, ~4초)은 이미 소진돼 알림은 또 영구 유실됐다. 즉 **§4는 "Outbox → Kafka" 구간의 병목만 없앴을 뿐, "Kafka → Read Model"(컨슈머 처리) 구간의 병목(§1)은 그대로 남아있다** — 전체 파이프라인의 체감 지연은 병목이 옮겨갔을 뿐 크게 줄지 않을 수 있다. §2를 완전히 닫으려면 §1(청크 분산 또는 컨슈머 자체의 처리량 개선)까지 손대야 한다.
 
-## 5. `SubscriberSyncConsumer`와 `PostPublishedFanoutConsumer`가 같은 Kafka consumer group을 공유
+## 5. [과거 결정 기록] `SubscriberSyncConsumer`와 `PostPublishedFanoutConsumer`가 같은 Kafka consumer group을 공유
 
-- **현재 구현**: `application.yml`의 `spring.kafka.consumer.group-id: notification-system` 하나를 두 리스너가 그대로 공유한다 — 각기 다른 토픽(`subscription.changed`, `post.published`)을 구독하지만 그룹은 동일하다.
+> **현재 결론(2026-09-10)**: 리스너별 그룹을 `subscriber-sync`, `fanout-dispatcher`, `fanout-chunk-worker`로 분리했다. 아래 `post-fanout` 표기는 단일 Consumer가 존재하던 당시의 이력이다. 스케줄러 풀도 Relay·Push·Fan-out retry 작업을 위해 현재 4로 구성한다.
+
+- **당시 구현(2026-08)**: `application.yml`의 `spring.kafka.consumer.group-id: notification-system` 하나를 두 리스너가 공유했다.
 - **트레이드오프**: 지금은 문제없이 동작하지만(각자 자기 토픽의 파티션만 할당받음), 같은 그룹 안에 서로 다른 구독 목록을 가진 컨슈머가 섞이는 구성은 Kafka에서 권장되지 않는 패턴이다 — 인스턴스를 여러 개로 늘리거나 리밸런싱이 잦아지면 예상치 못한 파티션 재할당이 생길 수 있다.
 - **결정 필요 시점**: 인스턴스를 2개 이상으로 스케일아웃하기 전에 컨슈머별로 별도 group-id(`notification-system-subscriber-sync`, `notification-system-fanout` 등)로 분리한다.
 - **[2026-08-21 실측 추가]**: 이건 Kafka consumer group 얘기와는 별개로, `@Scheduled` 작업(`PostOutboxRelay`, `SubscriptionOutboxRelay`, `PushDeliveryWorker`)도 Spring Boot 기본 설정상 **단일 스레드 스케줄러 하나를 전부 공유**한다. 장애 주입 테스트(`docs/test/chaos-test-report.md` §1.1)에서 `SubscriptionOutboxRelay`가 약 11,700건의 백로그를 처리하는 동안 다른 Relay/Worker가 지연되는 것을 실측했다 — 단일 인스턴스에서도 발생하는 문제라 "인스턴스 스케일아웃 전"이라는 기존 트리거로는 충분하지 않다. **새 결정 필요 시점**: Relay/Worker별로 별도 스케줄러 스레드(또는 스레드 풀)를 쓰도록 `TaskScheduler` 빈을 분리한다 — 지금처럼 여러 스케줄 작업이 하나의 스레드를 공유하면, 한 작업의 백로그가 다른 작업의 지연 보장을 깨뜨릴 수 있다.
@@ -66,18 +83,19 @@
 - **결정**: `architecture.md` §5가 설계한 `delivery.push.requested`/`delivery.push.dlq` Kafka 토픽 기반 구조 대신, `PushDeliveryWorker`가 `notification.notification_delivery_log`를 `@Scheduled(fixedDelay=1000)`로 폴링하는 방식으로 구현했다. `PostOutboxRelay`/`SubscriptionOutboxRelay`와 동일한 패턴이며, 이 테이블에 이미 있던 `idx_notification_delivery_retry_queue` 인덱스가 정확히 이 폴링을 겨냥한 것이었다.
 - **근거**: `architecture.md` §5가 "채널별 토픽 분리"를 원한 이유는 FR-3.4(한 채널 장애가 다른 채널에 영향 없음)였는데, 이 시스템은 Push 채널만 지원하므로 격리할 다른 채널이 없다 — 토픽 분리의 원래 근거가 소멸했다. 새 Kafka 토픽/컨슈머 그룹을 추가하는 비용 대비 얻는 게 없다고 판단했다.
 - **재시도 정책**: `architecture.md` §5의 예시(1s, 2s, 4s, 최대 3회)를 그대로 따르지 않고 근사치로 단순화했다 — attempt 1회차는 즉시, 이후 `2^(attempt_count-1)`초 백오프(1s, 2s)로 최대 3회 시도 후 `DEAD_LETTER` 전이. "최대 3회"면 3번째 시도 전 대기가 2s로 끝나 4s 대기까지는 가지 않는다.
-- **트레이드오프**: `delivery.push.requested`의 파티션 분산(원 설계 — "랜덤/round-robin, 높음(32)")이 주려던 "발송 요청을 여러 워커에 넓게 분산"하는 수평 확장성은 지금 없다 — `PushDeliveryWorker`는 인스턴스 하나당 순차 폴링이다. 인기 작가 팬아웃으로 delivery log가 대량 쌓이면 이 워커 하나가 병목이 될 수 있다.
+- **초기 트레이드오프**: 처음에는 인스턴스별 순차 폴링이라 여러 워커가 같은 행을 집을 위험과 제한된 확장성이 있었다.
+- **[2026-09-10 보완 완료]**: `FOR UPDATE SKIP LOCKED`와 `PROCESSING` claim token/lease를 도입했다. 여러 인스턴스가 서로 다른 행을 안전하게 claim하며, 만료된 claim은 회수된다. 실제 처리량의 수평 증가 폭은 부하 테스트에서 측정한다.
 - **결정 필요 시점**: Push 외 다른 채널을 다시 지원하게 되거나, 부하 테스트에서 이 워커가 병목으로 드러나면 Kafka 토픽 기반 구조로 전환한다.
 
 ## 요약 — 지금 결정이 필요한 것 vs 나중으로 미뤄도 되는 것
 
 | 항목 | 지금 결정 필요? | 트리거 |
 |---|---|---|
-| 1. 청크 미분산 / 컨슈머 처리 속도 | ⚠️ **부분 조치 완료 + 재현 검증 완료(2026-08-28)** | `SubscriberSyncConsumer` 배치 전환 + 파티션 6개로 Read Model 반영 시간 259초→41.7초(약 10배) 개선 실측(`chaos-test-report.md` §1.4). `PostPublishedFanoutConsumer`의 청크 Dispatcher/Worker 분리(`architecture.md` §4)는 여전히 미착수 — 대량 백로그에서 재시도 예산을 넘기는 문제(§2)는 아직 안 닫힘 |
-| 2. Read Model 동기화 레이스 | ⚠️ **부분 조치, 대량 백로그에서는 여전히 재현됨** | Fan-out 재시도(~4초)로 일반적인 케이스는 흡수. §1 개선 후에도 12,156건 백로그에서 재현 시 read model 반영(41.7초)이 재시도 예산(~4초)을 초과해 알림 영구 유실 확인(2026-08-28, `chaos-test-report.md` §1.4) |
+| 1. 청크 미분산 / 컨슈머 처리 속도 | ✅ **구조 전환 완료(2026-09-09), 성능 재측정 필요** | `FanoutDispatcher`가 1,000명 키셋 청크를 발행하고 `FanoutChunkWorker`가 병렬 처리한다. 1,001명 경계·중복·중단 후 재개 통합 테스트를 추가했으며, 실제 10만 명/5초 SLA는 다시 측정해야 한다. |
+| 2. Read Model 동기화 레이스 | ✅ **시작 전 membership gate + 영속 재시도 완료** | 원본 ACTIVE 구독과 Read Model이 양방향으로 일치할 때만 첫 청크를 발행한다. 불일치하면 `WAITING_RETRY`로 영속화하고 지수 백오프로 재개한다. 스캔 시작 이후의 구독 변경은 eventual-consistency 의미를 따른다. |
 | 3. Relay 무한 재시도 | 아니오 (정상 동작 확인됨) | 장애 주입 테스트에서 재시도 폭주 없이 결국 전량 발행됨을 확인(`chaos-test-report.md` §1) |
 | 4. Relay 동기 블로킹 발행 | ✅ **조치 완료(2026-08-25)** | 비동기 콜백 + in-flight 중복 방지로 전환. Outbox→Kafka 드레인 시간 70~240초 → 약 7초로 단축 실측(`chaos-test-report.md` §1.3) |
-| 5-a. 스케줄러 스레드 공유 | ✅ **조치 완료(2026-08-24)** | `spring.task.scheduling.pool.size: 3`으로 해결, `/actuator/threaddump`로 검증 |
-| 5-b. Consumer group 공유 | ✅ **조치 완료(2026-08-27)** | `subscriber-sync`/`post-fanout`로 group-id 분리. 단일 인스턴스에서도 리밸런싱 반복으로 실제 장애가 나는 것을 확인하고 고침 |
-| 6. 백필 배치 미구현 | **예 — 기존 데이터 있는 환경 배포 전** | 프로덕션/기존 구독 데이터 마이그레이션 시 |
-| 7. Push 재시도/DLQ — DB 폴링, Kafka 토픽 없음 | 확정됨 (재논의 불필요) | Push 이외 채널을 다시 지원하며 채널별 장애 격리가 다시 필요해질 때 |
+| 5-a. 스케줄러 스레드 공유 | ✅ **조치 완료** | Relay·Push·Fan-out retry 작업을 위해 `spring.task.scheduling.pool.size: 4`로 구성 |
+| 5-b. Consumer group 공유 | ✅ **조치 완료** | 현재 `subscriber-sync`, `fanout-dispatcher`, `fanout-chunk-worker`로 리스너별 분리 |
+| 6. 백필 배치 | ✅ **조치 완료(2026-08-31)** | opt-in 키셋 백필과 멱등성 통합 테스트 구현 |
+| 7. Push 재시도/DLQ — DB 폴링, Kafka 토픽 없음 | ✅ **다중 인스턴스 클레임 보완 완료** | `FOR UPDATE SKIP LOCKED`와 만료 가능한 claim lease로 중복 발송을 방지한다. Push 이외 채널을 다시 지원할 때 채널별 격리를 재검토한다. |

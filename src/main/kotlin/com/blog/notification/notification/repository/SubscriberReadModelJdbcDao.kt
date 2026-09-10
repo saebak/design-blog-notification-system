@@ -75,4 +75,42 @@ class SubscriberReadModelJdbcDao(
             Long::class.java,
         ).filterNotNull()
     }
+
+    /**
+     * Prevents fan-out from starting while subscription events for this author are only partially
+     * reflected. This is a readiness gate, not a long-lived snapshot: once dispatch starts, later
+     * subscribe/cancel operations follow the system's eventual-consistency semantics.
+     */
+    fun isSynchronizedWithActiveSubscriptions(authorId: Long): Boolean {
+        val sql = """
+            SELECT NOT EXISTS (
+                SELECT 1
+                FROM subscription.subscriptions source
+                WHERE source.author_id = :authorId
+                  AND source.status = 'ACTIVE'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM notification.subscriber_read_model read_model
+                      WHERE read_model.author_id = source.author_id
+                        AND read_model.user_id = source.user_id
+                  )
+            ) AND NOT EXISTS (
+                SELECT 1
+                FROM notification.subscriber_read_model read_model
+                WHERE read_model.author_id = :authorId
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM subscription.subscriptions source
+                      WHERE source.author_id = read_model.author_id
+                        AND source.user_id = read_model.user_id
+                        AND source.status = 'ACTIVE'
+                  )
+            )
+        """.trimIndent()
+        return jdbcTemplate.queryForObject(
+            sql,
+            MapSqlParameterSource("authorId", authorId),
+            Boolean::class.java,
+        ) == true
+    }
 }

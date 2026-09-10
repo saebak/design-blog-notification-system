@@ -7,6 +7,7 @@ set -euo pipefail
 SUBSCRIBER_COUNT="${1:-500}"
 BASE_URL="${2:-http://localhost:8080}"
 JAR_PATH="${3:-build/libs/notification-system-0.0.1-SNAPSHOT.jar}"
+APP_PID="${4:?Pass the exact application PID as the fourth argument}"
 TS=$(date +%s)
 
 echo "=== Chaos-2: app crash mid-fanout, subscribers=$SUBSCRIBER_COUNT ==="
@@ -42,7 +43,7 @@ post_id=$(curl -s -X POST "$BASE_URL/api/posts" -H 'Content-Type: application/js
   | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')
 echo "post_id=$post_id"
 
-old_pid=$(tasklist //FI "IMAGENAME eq java.exe" //FO CSV 2>/dev/null | tail -1 | cut -d',' -f2 | tr -d '"')
+old_pid="$APP_PID"
 echo "current app PID=$old_pid"
 
 echo "Publishing, then killing the app shortly after..."

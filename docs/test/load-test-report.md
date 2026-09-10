@@ -2,9 +2,11 @@
 
 > 시나리오 설계는 [`load-test-plan.md`](./load-test-plan.md) 참고. 이 문서는 **실제 실행 결과**를 기록한다.
 
+> **기준선 주의(2026-09-10)**: 아래 수치는 단일 `PostPublishedFanoutConsumer` 시절의 과거 결과다. 현재의 1,000명 키셋 Dispatcher, 32개 파티션, Chunk Worker 동시성 6 구조를 반영하지 않으므로 NFR 충족 근거로 사용할 수 없다. 현행 재측정 결과는 아직 비어 있다.
+
 ## 0. 실행 환경과 스코프 축소 — 왜 원 계획과 다르게 실행했는가
 
-`load-test-plan.md`는 원래의 전체 아키텍처(청크 Dispatcher/Chunk Worker, Kafka 기반 Push/Email 발송 토픽, WebSocket, Redis Pub/Sub, Prometheus 커스텀 메트릭)를 전제로 설계됐다. 실제 구현은 그보다 훨씬 단순화됐다(`docs/decisions.md` 참고 — 청크 미분산 단일 컨슈머, Email 제외, WebSocket 제외, DB 폴링 기반 Push 재시도, 메트릭은 로깅만). 그래서 이번 실행은 원 계획의 시나리오를 **실제 구현에 대응하는 형태로 재설계**해 진행했다.
+2026-08 실행 당시 `load-test-plan.md`는 청크 Dispatcher/Chunk Worker, Kafka 기반 Push/Email 발송 토픽, WebSocket, Redis Pub/Sub, Prometheus 커스텀 메트릭을 전제로 했지만 실제 코드는 청크 미분산 단일 Consumer와 DB 폴링 Push 구조였다. 그래서 당시 구현에 맞게 시나리오를 재설계해 실행했다. 이 설명은 현재 구조를 뜻하지 않는다.
 
 또한 이 실행 환경(로컬 개발 머신, 여유 메모리 약 1.2GB 수준)이 매우 제한적이라 원 계획의 절대 규모(구독자 10만 명)로는 안정적으로 실행할 수 없었다. `load-test-plan.md` §2가 이미 "로컬 인프라이므로 절대적 처리량보다는 설계가 목표한 배율 확인에 의의를 둔다"고 명시했듯, 이번 실행도 **정확성/패턴 검증 목적**으로 규모를 대폭 축소했다(수백 명 단위). NFR-1의 절대 수치(5초/10만 명/20,000 msg/sec)를 이 규모로 검증했다고 주장하지 않는다.
 

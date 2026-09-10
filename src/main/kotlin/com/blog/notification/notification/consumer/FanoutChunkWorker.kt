@@ -2,6 +2,7 @@ package com.blog.notification.notification.consumer
 
 import com.blog.notification.common.kafka.KafkaTopics
 import com.blog.notification.notification.consumer.dto.FanoutChunkRequestedMessage
+import com.blog.notification.notification.operations.NotificationOperationsMetrics
 import com.blog.notification.notification.repository.NotificationDeliveryLogJdbcDao
 import com.blog.notification.notification.repository.NotificationInsert
 import com.blog.notification.notification.repository.NotificationJdbcDao
@@ -18,6 +19,7 @@ class FanoutChunkWorker(
     private val notificationDao: NotificationJdbcDao,
     private val deliveryLogDao: NotificationDeliveryLogJdbcDao,
     private val objectMapper: ObjectMapper,
+    private val metrics: NotificationOperationsMetrics,
 ) {
     @KafkaListener(topics = [KafkaTopics.FANOUT_CHUNK_REQUESTED], groupId = "fanout-chunk-worker", concurrency = "6")
     @Transactional
@@ -30,5 +32,6 @@ class FanoutChunkWorker(
             )
             if (user.notificationChannel == NotificationChannel.PUSH) deliveryLogDao.insertPending(notificationId)
         }
+        metrics.recordFanoutChunkCompleted()
     }
 }

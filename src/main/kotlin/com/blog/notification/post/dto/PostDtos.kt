@@ -4,11 +4,13 @@ import com.blog.notification.post.Post
 import com.blog.notification.post.PostStatus
 import jakarta.validation.constraints.NotBlank
 import jakarta.validation.constraints.NotNull
+import jakarta.validation.constraints.Positive
+import jakarta.validation.constraints.Size
 import java.time.Instant
 
 data class CreatePostRequest(
-    @field:NotNull val authorId: Long,
-    @field:NotBlank val title: String,
+    @field:NotNull @field:Positive val authorId: Long,
+    @field:NotBlank @field:Size(max = 200) val title: String,
     @field:NotBlank val content: String,
 )
 

@@ -3,6 +3,8 @@ package com.blog.notification.common
 import java.time.Instant
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
+import org.springframework.web.bind.MethodArgumentNotValidException
+import org.springframework.web.method.annotation.HandlerMethodValidationException
 import org.springframework.web.bind.annotation.ExceptionHandler
 import org.springframework.web.bind.annotation.RestControllerAdvice
 
@@ -26,6 +28,16 @@ class ApiExceptionHandler {
 
     @ExceptionHandler(IllegalArgumentException::class)
     fun handleBadRequest(ex: IllegalArgumentException): ResponseEntity<ErrorResponse> =
+        respond(HttpStatus.BAD_REQUEST, ex.message)
+
+    @ExceptionHandler(MethodArgumentNotValidException::class)
+    fun handleInvalidBody(ex: MethodArgumentNotValidException): ResponseEntity<ErrorResponse> {
+        val message = ex.bindingResult.fieldErrors.joinToString(", ") { "${it.field}: ${it.defaultMessage}" }
+        return respond(HttpStatus.BAD_REQUEST, message)
+    }
+
+    @ExceptionHandler(HandlerMethodValidationException::class)
+    fun handleInvalidParameter(ex: HandlerMethodValidationException): ResponseEntity<ErrorResponse> =
         respond(HttpStatus.BAD_REQUEST, ex.message)
 
     private fun respond(status: HttpStatus, message: String?): ResponseEntity<ErrorResponse> =

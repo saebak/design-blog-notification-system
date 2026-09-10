@@ -207,15 +207,19 @@ CREATE INDEX idx_notifications_unread
 ### 4.3 `notification_delivery_log`
 `domain-design.md` §5.3의 `DeliveryAttempt` Entity가 매핑되는 물리 테이블이다 (`Notification` 1건당 채널별 최대 1행).
 
+현재 런타임은 `PUSH` 행만 생성한다. `EMAIL` 값은 향후 채널 확장을 위해 스키마 계약에 남겨둔다.
+
 ```sql
 CREATE TABLE notification_delivery_log (
     id               BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     notification_id  BIGINT NOT NULL,
     channel          VARCHAR(10) NOT NULL CHECK (channel IN ('PUSH', 'EMAIL')),
     status           VARCHAR(15) NOT NULL DEFAULT 'PENDING'
-                     CHECK (status IN ('PENDING', 'SENT', 'FAILED', 'DEAD_LETTER')),
+                     CHECK (status IN ('PENDING', 'PROCESSING', 'SENT', 'FAILED', 'DEAD_LETTER')),
     attempt_count    INT NOT NULL DEFAULT 0,
     last_attempt_at  TIMESTAMPTZ,
+    claim_token      UUID,
+    claimed_until    TIMESTAMPTZ,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     CONSTRAINT uq_notification_channel UNIQUE (notification_id, channel)
@@ -225,20 +229,43 @@ CREATE TABLE notification_delivery_log (
 CREATE INDEX idx_notification_delivery_retry_queue
     ON notification_delivery_log (channel, last_attempt_at)
     WHERE status IN ('PENDING', 'FAILED');
+
+CREATE INDEX idx_notification_delivery_expired_claim
+    ON notification_delivery_log (claimed_until)
+    WHERE status = 'PROCESSING';
 ```
 
 **인덱스 근거**
 - `uq_notification_channel`: 채널당 발송 이력은 알림 1건에 1행만 존재 (재시도는 같은 행의 `attempt_count`/`status`를 갱신하는 것이지 새 행 추가가 아님).
 - `idx_notification_delivery_retry_queue`: 발송기 워커가 `WHERE channel = ? AND status IN ('PENDING','FAILED') ORDER BY last_attempt_at`로 재시도 대상을 뽑는 쿼리를 지원. 부분 인덱스로 `SENT`/`DEAD_LETTER` 완료 건은 제외해 인덱스를 작게 유지.
+- `claim_token`/`claimed_until`: 여러 Push Worker가 `FOR UPDATE SKIP LOCKED`로 서로 다른 행을 claim하고, lease가 만료되면 다른 워커가 회수한다. 이전 token의 상태 갱신은 거부한다.
 - `notification_id`는 `notifications.id`를 값으로만 참조한다(이 프로젝트 전반의 FK 미사용 원칙 — `database-design.md` §0 — 을 같은 스키마 내 테이블 간에도 동일하게 적용). 별도 인덱스는 만들지 않음 — 이 컬럼으로 조회하는 패턴(알림 상세에서 발송 상태 보기)이 저빈도이고, `uq_notification_channel` 유니크 인덱스가 `(notification_id, channel)` 선두 컬럼으로서 이미 `notification_id` 단독 조회도 어느 정도 커버.
 
-### 4.4 Fan-out 진행률 추적 — DB 테이블 대신 메트릭 (NFR-4.1)
+### 4.4 Fan-out 진행 상태와 메트릭 (NFR-4.1)
 
-팬아웃 진행률(총 대상자 수, 처리된 수, SLA 위반 여부)은 별도 DB 테이블(`fanout_jobs`)로 두지 않는다.
+Dispatcher의 재시작 안전성을 위해 실제 구현에는 `notification.fanout_dispatches`가 존재한다.
+
+```sql
+CREATE TABLE notification.fanout_dispatches (
+    event_id UUID PRIMARY KEY,
+    post_id BIGINT,
+    author_id BIGINT NOT NULL,
+    title VARCHAR(200),
+    cursor_user_id BIGINT,
+    next_chunk_index INT NOT NULL DEFAULT 0,
+    status VARCHAR(15) NOT NULL,
+    retry_count INT NOT NULL DEFAULT 0,
+    next_retry_at TIMESTAMPTZ,
+    last_error VARCHAR(500),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+이 테이블은 총 처리량을 집계하는 hot row가 아니라, event ID별 cursor·재시도·완료 상태를 보존하는 작업 저널이다. 청크 처리량과 상태별 backlog 관측은 Prometheus 지표로 분리한다.
 
 - 이유: 팬아웃 1건당 최대 100개 Chunk Worker가 "처리된 수" 하나를 공유해서 갱신해야 하므로, 테이블로 만들면 **쓰기 경합(hot row)**이 생긴다. NFR-1(5초 내 처리)을 지키려는 관측 장치가 오히려 그 SLA를 깎아먹는 역설이 생길 수 있음.
-- 대신 Dispatcher/Chunk Worker가 각자 독립적으로 Prometheus 카운터·히스토그램을 emit하고(`fanout_chunks_dispatched_total`, `fanout_chunks_completed_total`, `fanout_chunk_duration_seconds`), `eventId`를 공통 라벨로 붙여 상관관계를 추적한다. "5초 넘게 안 끝난 팬아웃"은 Grafana 알림 룰로 잡는다.
-- 이벤트 단위 멱등성(같은 `PostPublished` 재처리 방지)은 이 문서의 테이블이 아니라 Dispatcher의 `eventId` 처리 이력(Redis SETNX 등, `architecture.md` §4.3)이 담당하고, 수신자 단위 멱등성은 §4.2 `notifications.uq_recipient_event`가 담당한다.
+- Dispatcher/Chunk Worker는 `notification_fanout_chunks_dispatched_total`, `notification_fanout_chunks_completed_total`과 상태별 gauge를 노출한다. 고 cardinality 방지를 위해 event ID를 메트릭 라벨로 사용하지 않는다.
+- 이벤트 단위 재개/멱등성은 `fanout_dispatches.event_id`와 cursor가 담당하고, 수신자 단위 멱등성은 §4.2 `notifications.uq_recipient_event`가 담당한다.
 - 자세한 내용은 `architecture.md` §4.4 참고.
 
 ---
