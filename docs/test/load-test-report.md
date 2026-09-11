@@ -2,7 +2,50 @@
 
 > 시나리오 설계는 [`load-test-plan.md`](./load-test-plan.md) 참고. 이 문서는 **실제 실행 결과**를 기록한다.
 
-## 2026-09-11 현행 구조 10만 명 재측정
+## 2026-09-11 membership 인덱스/쿼리 최적화 후 재측정
+
+### 변경 이유와 방법
+
+최적화 전 exact membership gate는 원본 ACTIVE 구독과 Read Model의 양방향 차집합을 두 개의 상관 `NOT EXISTS`로 검사했다. 인기 작가 기준으로 필요한 접근 순서는 `(author_id, user_id)`지만, 원본 테이블에는 백필 키셋용 `(author_id, id)` 부분 인덱스와 `(user_id, author_id)` unique 인덱스만 있었다. 실제 계획은 `idx_subscriptions_user`를 넓게 스캔한 뒤 `author_id`를 필터링했고, 두 번째 10만 명 실행에서는 약 10분 55초 동안 실행됐다.
+
+다음 두 변경을 적용했다.
+
+1. `subscription.subscriptions(author_id, user_id) WHERE status = 'ACTIVE'` 부분 인덱스를 추가했다. 취소 행을 제외해 인덱스를 작게 유지하면서 작가 한 명의 활성 구독자 집합을 바로 읽는다.
+2. 두 방향의 상관 anti-join을 한 번의 `FULL OUTER JOIN`으로 합쳐 대칭 차집합이 존재하는지만 검사한다. count-only 비교가 아니므로 같은 건수에 서로 다른 사용자가 들어 있는 불일치도 탐지한다. 이 정확성 조건은 통합 테스트로 고정했다.
+
+### 쿼리 단독 검증
+
+100,000명의 원본 구독과 Read Model이 일치하는 작가를 대상으로 `EXPLAIN (ANALYZE, BUFFERS)`를 실행했다.
+
+| 항목 | 최적화 전 | 최적화 후 |
+|---|---:|---:|
+| exact membership 검사 | 약 655초(실행 중 관측) | **341.178 ms** |
+| 원본 구독 접근 | `idx_subscriptions_user` 스캔 후 작가 필터 | **새 부분 인덱스 Index Only Scan** |
+| Read Model 접근 | 반복 상관 조회 | **PK `(author_id, user_id)` Index Only Scan** |
+| 개선 배율 | - | **약 1,920배** |
+
+### 동일 10만 명 전체 경로 재측정
+
+기존 측정과 같은 단일 Spring Boot 프로세스, PostgreSQL/Kafka 단일 노드, 1,000명 청크, Kafka 32파티션, Chunk Worker 동시성 6 조건을 사용했다. 시딩 시간 7,310ms와 발행 HTTP 응답 190ms는 SLA에서 제외했고, Outbox 생성 DB 시각부터 마지막 Notification/delivery row 생성 DB 시각까지 측정했다.
+
+| 지표 | 최적화 전 실행 1 | 최적화 전 실행 2 | 최적화 후 |
+|---|---:|---:|---:|
+| Dispatcher 완료 | 291,016.4 ms | 669,627.9 ms | **6,967.2 ms** |
+| Notification 100,000건 생성 | 390,725.7 ms | 761,649.5 ms | **186,108.7 ms** |
+| Push delivery row 100,000건 생성 | 390,725.7 ms | 761,649.5 ms | **186,108.7 ms** |
+| 처리량 | 255.9 msg/sec | 131.3 msg/sec | **537.3 msg/sec** |
+| 발행 청크 / 재시도 | 100 / 0 | 100 / 0 | **100 / 0** |
+| 5초 / 20,000 msg/sec SLA | 실패 | 실패 | **실패** |
+
+- Dispatcher 단계는 약 **41.8~96.1배**, 전체 행 생성은 약 **2.1~4.1배**, 처리량은 약 **2.1~4.1배** 개선됐다.
+- Notification과 Push 작업은 각각 정확히 100,000건 생성돼 중복·누락이 없었다. SLA 종료 시점의 Push 전달 상태는 `SENT 20,272`, `PROCESSING 228`, `PENDING 79,500`이었으며, 실제 외부 Push 전달은 정의상 SLA 크리티컬 패스에 포함하지 않는다.
+- Dispatcher도 5초를 1.97초 초과했고 전체 경로는 186.1초이므로 NFR-1은 여전히 실패다. membership 병목 제거 후 전체 시간의 약 96%가 Dispatcher 완료 이후 Chunk Worker 처리에 쓰였다. 다음 우선순위는 수신자마다 두 번 수행되는 최소 200,000회의 개별 INSERT를 JDBC batch 또는 set-based bulk INSERT로 줄이는 것이다.
+
+재현 명령은 `scripts/load-test/fanout-sla-100k.ps1 -SubscriberCount 100000 -TimeoutSeconds 900`이며 실행 ID는 `20260911094756362`, event ID는 `038c538a-e61c-4526-bfb9-e1da42ac203b`다. 로컬 단일 노드 결과이므로 프로덕션 용량으로 일반화하지 않는다.
+
+---
+
+## 2026-09-11 최적화 전 현행 구조 10만 명 기준선
 
 ### 실행 조건
 

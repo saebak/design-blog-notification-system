@@ -118,6 +118,11 @@ CREATE INDEX idx_subscriptions_author_active
     ON subscriptions (author_id, id)
     WHERE status = 'ACTIVE';
 
+-- Fan-out 시작 전 원본/Read Model exact membership 비교
+CREATE INDEX idx_subscriptions_author_active_membership
+    ON subscriptions (author_id, user_id)
+    WHERE status = 'ACTIVE';
+
 -- "내 구독 목록" 조회
 CREATE INDEX idx_subscriptions_user
     ON subscriptions (user_id)
@@ -138,7 +143,8 @@ WHERE subscriptions.status = 'CANCELLED';
 `DO UPDATE ... WHERE`는 기존 행이 `CANCELLED`일 때만 재활성화하고, 이미 `ACTIVE`인 행에 대한 재구독 요청은 조용히 무시한다(멱등). `domain-design.md` §4의 `subscribe()` 행위와 매핑된다.
 
 - `idx_subscriptions_author_active`: **키셋 페이지네이션**(`WHERE author_id = ? AND id > :lastId ORDER BY id LIMIT N`)을 위해 `id`를 두 번째 컬럼으로 포함. `OFFSET` 방식은 10만 건 규모에서 뒤로 갈수록 느려지므로 배제.
-- 두 인덱스 모두 `status = 'ACTIVE'` 부분 인덱스로 만들어 취소된 구독이 인덱스 크기에 영향을 주지 않게 함.
+- `idx_subscriptions_author_active_membership`: Dispatcher의 exact membership gate가 특정 작가의 `user_id` 집합을 읽는 접근 순서에 맞춘다. 기존 `(author_id, id)`는 백필 커서용이고 `(user_id, author_id)` unique 인덱스는 선두 컬럼이 반대라 이 검사에 적합하지 않았다. 10만 명 `FULL OUTER JOIN` 검증에서 원본과 Read Model 모두 Index Only Scan을 사용해 약 341ms가 측정됐다.
+- 세 조회 인덱스 모두 `status = 'ACTIVE'` 부분 인덱스로 만들어 취소된 구독이 인덱스 크기에 영향을 주지 않게 함.
 
 ### 3.2 `subscription_outbox_events`
 Post Context의 `outbox_events`와 동일한 구조 (event_type = `'SubscriptionChanged'`). DDL 생략 (§2.2와 동일 패턴).
@@ -277,6 +283,7 @@ CREATE TABLE notification.fanout_dispatches (
 | 이메일 기준 사용자 조회(로그인) | - | users | uq_users_email |
 | Outbox 미발행 이벤트 폴링 | NFR-2.2 | outbox_events | idx_outbox_pending (partial) |
 | 작가별 구독자 벌크 조회(백필) | FR-1.2 | subscriptions | idx_subscriptions_author_active |
+| 원본/Read Model exact membership 비교 | FR-2.3 | subscriptions | idx_subscriptions_author_active_membership (partial) |
 | Fan-out 청크 스캔 | FR-2.4 | subscriber_read_model | PK (author_id, user_id) |
 | 수신 채널(Mute) 벌크 조회 | FR-3.3 | users | PK (`WHERE id = ANY(:chunkIds)`) |
 | 멱등 알림 삽입 | FR-2.5 | notifications | uq_recipient_event |

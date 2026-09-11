@@ -103,6 +103,43 @@ class FanoutDispatcherRetryIntegrationTest {
         assertEquals("DONE", dispatchDao.find(eventId)?.status)
     }
 
+    @Test
+    fun `equal counts with different members still waits for exact synchronization`() {
+        val suffix = UUID.randomUUID().toString()
+        val author = userRepository.save(User(email = "set-author-$suffix@test.com", name = "author"))
+        val first = userRepository.save(User(email = "set-first-$suffix@test.com", name = "first"))
+        val second = userRepository.save(User(email = "set-second-$suffix@test.com", name = "second"))
+        val stale = userRepository.save(User(email = "set-stale-$suffix@test.com", name = "stale"))
+        val authorId = requireNotNull(author.id)
+        val firstId = requireNotNull(first.id)
+        val secondId = requireNotNull(second.id)
+        val staleId = requireNotNull(stale.id)
+        insertActiveSubscription(authorId, firstId)
+        insertActiveSubscription(authorId, secondId)
+        subscriberReadModelDao.upsert(authorId, firstId)
+        subscriberReadModelDao.upsert(authorId, staleId)
+
+        val eventId = UUID.randomUUID()
+        val postId = 900_003L
+        val message = PostPublishedMessage(eventId, postId, authorId, "equal count mismatch", Instant.now())
+        dispatcher.onMessage(objectMapper.writeValueAsString(message))
+
+        assertEquals("WAITING_RETRY", dispatchDao.find(eventId)?.status)
+        assertTrue(notificationRecipients(postId).isEmpty())
+
+        subscriberReadModelDao.delete(authorId, staleId)
+        subscriberReadModelDao.upsert(authorId, secondId)
+        val deadline = System.currentTimeMillis() + 15_000
+        while (System.currentTimeMillis() < deadline) {
+            dispatcher.retryDueDispatches()
+            if (notificationRecipients(postId).size == 2) break
+            Thread.sleep(200)
+        }
+
+        assertEquals(listOf(firstId, secondId).sorted(), notificationRecipients(postId))
+        assertEquals("DONE", dispatchDao.find(eventId)?.status)
+    }
+
     private fun insertActiveSubscription(authorId: Long, userId: Long) {
         jdbcTemplate.update(
             "INSERT INTO subscription.subscriptions (user_id, author_id, status) VALUES (:userId, :authorId, 'ACTIVE')",

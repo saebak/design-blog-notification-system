@@ -2,7 +2,7 @@
 
 > 원본 요구사항(기능/비기능)을 실제 구현 단위로 분해한 문서. 각 항목은 이후 설계 문서 및 구현 태스크의 기준선(baseline) 역할을 한다.
 
-## 구현 상태 (2026-09-10)
+## 구현 상태 (2026-09-11)
 
 | 구분 | 상태 |
 |---|---|
@@ -10,7 +10,7 @@
 | Outbox Relay, Subscriber Read Model, Dispatcher/Chunk Worker 팬아웃 | 구현 완료 |
 | Push 영속 재시도, 다중 워커 claim lease, Dead Letter | 구현 완료 |
 | Prometheus 지표, 경보 규칙, 수동 복구 API, 자동 장애 복구 테스트 | 구현 완료 |
-| 현행 구조의 10만 명/5초 성능 검증 | 재실행 완료 — 정확성 통과, 390.7~761.6초로 SLA 실패 |
+| 현행 구조의 10만 명/5초 성능 검증 | membership 최적화 후 재실행 완료 — 정확성 통과, 186.1초·537.3 msg/sec로 개선됐지만 SLA 실패 |
 | 정확한 발행 시점 구독 스냅샷/워터마크 | 확장 구현(문서만 유지) |
 | 인증·RBAC, Email 발송, 알림 목록/실시간 WebSocket·SSE | 확장 구현(문서만 유지) |
 
@@ -129,6 +129,6 @@
 ## 5. 완료 기준 (Definition of Done)
 
 - 현재 구현 범위의 FR/NFR 항목은 코드 또는 테스트로 검증 가능해야 한다. 확장 항목은 문서에서 구현 범위와 분리한다.
-- [`load-test-report.md`](./test/load-test-report.md)에 과거 기준선과 현행 Dispatcher/Chunk Worker 10만 명 재측정 결과를 구분해 기록했다. 정확성은 통과했지만 5초 성능 SLA는 실패했다.
+- [`load-test-report.md`](./test/load-test-report.md)에 과거 기준선, 현행 Dispatcher/Chunk Worker 기준선, membership 최적화 후 10만 명 재측정 결과를 구분해 기록했다. 정확성은 통과했고 186.1초·537.3 msg/sec로 개선됐지만 5초 성능 SLA는 실패했다.
 - 장애 주입 테스트 결과가 [`/docs/test/chaos-test-report.md`](./test/chaos-test-report.md)에 기록되어 있다. 시나리오 설계는 `/docs/test/chaos-test-plan.md` 참고.
 - 아키텍처 설계와 다이어그램은 [`architecture.md`](./architecture.md)에 정리한다.

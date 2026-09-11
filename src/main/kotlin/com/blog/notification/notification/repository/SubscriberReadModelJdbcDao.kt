@@ -85,26 +85,17 @@ class SubscriberReadModelJdbcDao(
         val sql = """
             SELECT NOT EXISTS (
                 SELECT 1
-                FROM subscription.subscriptions source
-                WHERE source.author_id = :authorId
-                  AND source.status = 'ACTIVE'
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM notification.subscriber_read_model read_model
-                      WHERE read_model.author_id = source.author_id
-                        AND read_model.user_id = source.user_id
-                  )
-            ) AND NOT EXISTS (
-                SELECT 1
-                FROM notification.subscriber_read_model read_model
-                WHERE read_model.author_id = :authorId
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM subscription.subscriptions source
-                      WHERE source.author_id = read_model.author_id
-                        AND source.user_id = read_model.user_id
-                        AND source.status = 'ACTIVE'
-                  )
+                FROM (
+                    SELECT user_id
+                    FROM subscription.subscriptions
+                    WHERE author_id = :authorId AND status = 'ACTIVE'
+                ) source
+                FULL OUTER JOIN (
+                    SELECT user_id
+                    FROM notification.subscriber_read_model
+                    WHERE author_id = :authorId
+                ) read_model USING (user_id)
+                WHERE source.user_id IS NULL OR read_model.user_id IS NULL
             )
         """.trimIndent()
         return jdbcTemplate.queryForObject(
