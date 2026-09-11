@@ -2,9 +2,105 @@
 
 > 시나리오 설계는 [`load-test-plan.md`](./load-test-plan.md) 참고. 이 문서는 **실제 실행 결과**를 기록한다.
 
+## 2026-09-11 membership 인덱스/쿼리 최적화 후 재측정
+
+### 변경 이유와 방법
+
+최적화 전 exact membership gate는 원본 ACTIVE 구독과 Read Model의 양방향 차집합을 두 개의 상관 `NOT EXISTS`로 검사했다. 인기 작가 기준으로 필요한 접근 순서는 `(author_id, user_id)`지만, 원본 테이블에는 백필 키셋용 `(author_id, id)` 부분 인덱스와 `(user_id, author_id)` unique 인덱스만 있었다. 실제 계획은 `idx_subscriptions_user`를 넓게 스캔한 뒤 `author_id`를 필터링했고, 두 번째 10만 명 실행에서는 약 10분 55초 동안 실행됐다.
+
+다음 두 변경을 적용했다.
+
+1. `subscription.subscriptions(author_id, user_id) WHERE status = 'ACTIVE'` 부분 인덱스를 추가했다. 취소 행을 제외해 인덱스를 작게 유지하면서 작가 한 명의 활성 구독자 집합을 바로 읽는다.
+2. 두 방향의 상관 anti-join을 한 번의 `FULL OUTER JOIN`으로 합쳐 대칭 차집합이 존재하는지만 검사한다. count-only 비교가 아니므로 같은 건수에 서로 다른 사용자가 들어 있는 불일치도 탐지한다. 이 정확성 조건은 통합 테스트로 고정했다.
+
+### 쿼리 단독 검증
+
+100,000명의 원본 구독과 Read Model이 일치하는 작가를 대상으로 `EXPLAIN (ANALYZE, BUFFERS)`를 실행했다.
+
+| 항목 | 최적화 전 | 최적화 후 |
+|---|---:|---:|
+| exact membership 검사 | 약 655초(실행 중 관측) | **341.178 ms** |
+| 원본 구독 접근 | `idx_subscriptions_user` 스캔 후 작가 필터 | **새 부분 인덱스 Index Only Scan** |
+| Read Model 접근 | 반복 상관 조회 | **PK `(author_id, user_id)` Index Only Scan** |
+| 개선 배율 | - | **약 1,920배** |
+
+### 동일 10만 명 전체 경로 재측정
+
+기존 측정과 같은 단일 Spring Boot 프로세스, PostgreSQL/Kafka 단일 노드, 1,000명 청크, Kafka 32파티션, Chunk Worker 동시성 6 조건을 사용했다. 시딩 시간 7,310ms와 발행 HTTP 응답 190ms는 SLA에서 제외했고, Outbox 생성 DB 시각부터 마지막 Notification/delivery row 생성 DB 시각까지 측정했다.
+
+| 지표 | 최적화 전 실행 1 | 최적화 전 실행 2 | 최적화 후 |
+|---|---:|---:|---:|
+| Dispatcher 완료 | 291,016.4 ms | 669,627.9 ms | **6,967.2 ms** |
+| Notification 100,000건 생성 | 390,725.7 ms | 761,649.5 ms | **186,108.7 ms** |
+| Push delivery row 100,000건 생성 | 390,725.7 ms | 761,649.5 ms | **186,108.7 ms** |
+| 처리량 | 255.9 msg/sec | 131.3 msg/sec | **537.3 msg/sec** |
+| 발행 청크 / 재시도 | 100 / 0 | 100 / 0 | **100 / 0** |
+| 5초 / 20,000 msg/sec SLA | 실패 | 실패 | **실패** |
+
+- Dispatcher 단계는 약 **41.8~96.1배**, 전체 행 생성은 약 **2.1~4.1배**, 처리량은 약 **2.1~4.1배** 개선됐다.
+- Notification과 Push 작업은 각각 정확히 100,000건 생성돼 중복·누락이 없었다. SLA 종료 시점의 Push 전달 상태는 `SENT 20,272`, `PROCESSING 228`, `PENDING 79,500`이었으며, 실제 외부 Push 전달은 정의상 SLA 크리티컬 패스에 포함하지 않는다.
+- Dispatcher도 5초를 1.97초 초과했고 전체 경로는 186.1초이므로 NFR-1은 여전히 실패다. membership 병목 제거 후 전체 시간의 약 96%가 Dispatcher 완료 이후 Chunk Worker 처리에 쓰였다. 다음 우선순위는 수신자마다 두 번 수행되는 최소 200,000회의 개별 INSERT를 JDBC batch 또는 set-based bulk INSERT로 줄이는 것이다.
+
+재현 명령은 `scripts/load-test/fanout-sla-100k.ps1 -SubscriberCount 100000 -TimeoutSeconds 900`이며 실행 ID는 `20260911094756362`, event ID는 `038c538a-e61c-4526-bfb9-e1da42ac203b`다. 로컬 단일 노드 결과이므로 프로덕션 용량으로 일반화하지 않는다.
+
+---
+
+## 2026-09-11 최적화 전 현행 구조 10만 명 기준선
+
+### 실행 조건
+
+| 항목 | 값 |
+|---|---|
+| 코드 기준 | `91ff2f9` (`develop`) |
+| 애플리케이션 | 단일 Spring Boot 4.1.0 프로세스, Java 17.0.20 |
+| 인프라 | 로컬 Docker Compose, PostgreSQL 16.15, Kafka 3.8.0 단일 브로커 |
+| Fan-out 구성 | 1,000명 키셋 청크, `fanout.chunk.requested` 32파티션, Chunk Worker 동시성 6 |
+| 데이터 준비 | 실행별 신규 작가 1명, PUSH 구독자 100,000명. 원본 구독과 Read Model을 동일하게 벌크 시딩 |
+| SLA 시작/종료 | `PostPublished` Outbox 생성 시각 → 마지막 Notification 및 Push delivery row 생성 시각 |
+| 실행 스크립트 | `scripts/load-test/fanout-sla-100k.ps1` |
+
+시딩은 SLA 측정에서 제외했다. HTTP 폴링 오차를 피하기 위해 `outbox_events.created_at`, `fanout_dispatches.updated_at`, `notifications.created_at`, `notification_delivery_log.created_at`의 DB 타임스탬프로 시간을 계산했다. Dispatcher의 `DONE`은 청크 발행 완료일 뿐 Chunk Worker 완료가 아니므로, 최종 SLA는 알림과 Push 작업 100,000건이 모두 생성된 시점으로 판정했다.
+
+### 결과
+
+| 지표 | 실행 1 | 실행 2 |
+|---|---:|---:|
+| Dispatcher 완료 | 291,016.4 ms | 669,627.9 ms |
+| 알림 100,000건 생성 완료 | **390,725.7 ms** | **761,649.5 ms** |
+| Push delivery row 100,000건 생성 완료 | **390,725.7 ms** | **761,649.5 ms** |
+| 처리량(최종 생성 기준) | **255.9 msg/sec** | **131.3 msg/sec** |
+| 발행/완료 청크 | 100 / 100 | 100 / 100 |
+| Dispatcher 재시도 | 0 | 0 |
+| 최종 Push 상태 | SENT 100,000건 | SENT 100,000건 |
+| 5초 / 20,000 msg/sec SLA | **실패** | **실패** |
+
+두 실행 모두 알림과 Push 작업의 중복·누락 없이 정확히 100,000건을 만들었고 최종 Push 상태도 전부 `SENT`였다. Prometheus 누계도 `dispatched=200`, `completed=200`, `claimed=200,000`, `sent=200,000`으로 DB 결과와 일치했으며 failed/dead-letter/in-progress/waiting-retry gauge는 모두 0이었다.
+
+성능은 목표에 미달했다. 실행 1은 5초보다 약 78.1배, 실행 2는 약 152.3배 오래 걸렸다. 데이터가 누적된 실행 2가 더 느려져 현재 쿼리/쓰기 경로가 데이터 증가에 민감하다는 신호도 확인됐다.
+
+### 관측된 병목
+
+1. **membership gate**: 실행 2에서 첫 청크 전 원본 ACTIVE 구독과 Read Model의 양방향 일치 검사 SQL이 PostgreSQL에서 10분 이상 `active` 상태로 실행됐다. 잠금 대기는 아니었다. `EXPLAIN`에서는 `subscriptions`의 `idx_subscriptions_user`를 스캔한 뒤 `author_id`를 필터링했다. 현재 `(author_id, id) WHERE status='ACTIVE'` 인덱스는 정확한 집합 비교에 필요한 `(author_id, user_id)` 순서를 제공하지 않는다.
+2. **수신자별 개별 INSERT**: `FanoutChunkWorker`는 청크 안의 사용자마다 Notification INSERT와 Push delivery INSERT를 각각 호출한다. 10만 명 기준 최소 20만 번의 개별 쓰기가 발생하며, Dispatcher 완료 뒤에도 최종 생성까지 실행 1은 약 99.7초, 실행 2는 약 92.0초가 더 필요했다.
+3. **로컬 단일 노드 한계**: Kafka/PostgreSQL/애플리케이션이 한 로컬 머신에서 동작한 결과이므로 프로덕션 용량 수치로 일반화할 수 없다. 다만 동일 환경에서도 목표 대비 차이가 매우 커, 인프라 증설 전에 위 두 코드/쿼리 병목을 먼저 해소해야 한다.
+
+### 판정과 다음 우선순위
+
+- **정확성: 통과** — 100청크, 알림/Push 작업 각 100,000건, 최종 SENT 100,000건, 재시도·DLQ 0건.
+- **성능 SLA: 실패** — 390.7~761.6초, 131.3~255.9 msg/sec.
+- **우선순위 1**: ACTIVE 구독 집합 비교에 맞는 `(author_id, user_id)` 부분 인덱스와 쿼리 계획을 검증한다.
+- **우선순위 2**: Chunk Worker의 수신자별 두 번 INSERT를 JDBC batch 또는 set-based bulk INSERT로 바꾼다.
+- **우선순위 3**: 동일 10만 명 테스트를 다시 실행한 뒤 Chunk Worker 인스턴스/동시성별 확장 효율을 측정한다.
+
+---
+
+## 과거 기준선 — 단일 Fan-out Consumer
+
+> 아래 수치는 2026-08 단일 `PostPublishedFanoutConsumer` 시절의 과거 결과이며 현행 구조의 성능 근거로 사용하지 않는다.
+
 ## 0. 실행 환경과 스코프 축소 — 왜 원 계획과 다르게 실행했는가
 
-`load-test-plan.md`는 원래의 전체 아키텍처(청크 Dispatcher/Chunk Worker, Kafka 기반 Push/Email 발송 토픽, WebSocket, Redis Pub/Sub, Prometheus 커스텀 메트릭)를 전제로 설계됐다. 실제 구현은 그보다 훨씬 단순화됐다(`docs/decisions.md` 참고 — 청크 미분산 단일 컨슈머, Email 제외, WebSocket 제외, DB 폴링 기반 Push 재시도, 메트릭은 로깅만). 그래서 이번 실행은 원 계획의 시나리오를 **실제 구현에 대응하는 형태로 재설계**해 진행했다.
+2026-08 실행 당시 `load-test-plan.md`는 청크 Dispatcher/Chunk Worker, Kafka 기반 Push/Email 발송 토픽, WebSocket, Redis Pub/Sub, Prometheus 커스텀 메트릭을 전제로 했지만 실제 코드는 청크 미분산 단일 Consumer와 DB 폴링 Push 구조였다. 그래서 당시 구현에 맞게 시나리오를 재설계해 실행했다. 이 설명은 현재 구조를 뜻하지 않는다.
 
 또한 이 실행 환경(로컬 개발 머신, 여유 메모리 약 1.2GB 수준)이 매우 제한적이라 원 계획의 절대 규모(구독자 10만 명)로는 안정적으로 실행할 수 없었다. `load-test-plan.md` §2가 이미 "로컬 인프라이므로 절대적 처리량보다는 설계가 목표한 배율 확인에 의의를 둔다"고 명시했듯, 이번 실행도 **정확성/패턴 검증 목적**으로 규모를 대폭 축소했다(수백 명 단위). NFR-1의 절대 수치(5초/10만 명/20,000 msg/sec)를 이 규모로 검증했다고 주장하지 않는다.
 
@@ -84,7 +180,7 @@
 |---|---|
 | E. WebSocket 실시간 push 지연 | WebSocket/SSE 자체가 스코프 밖(`docs/decisions.md` §9) — 측정 대상 없음 |
 | F. 백프레셔(다운스트림 지연 주입) | Push/Email 발송 토픽 구조 자체가 없음(DB 폴링 워커로 대체, `docs/decisions.md` §7). 유사한 재시도/DLQ 동작은 `chaos-test-report.md`에서 별도 검증 |
-| G. Chunk Worker/발송기 수평 확장 | 청크 Dispatcher/Chunk Worker가 존재하지 않음(단일 컨슈머, `docs/decisions.md` §1) — 인스턴스 수를 늘려도 지금 구현은 처리량이 늘지 않는다(늘리는 것 자체가 §1의 해결책) |
+| G. Chunk Worker/발송기 수평 확장 | 2026-08 당시에는 청크 Dispatcher/Chunk Worker가 존재하지 않아 측정할 수 없었음 |
 
 ## 2. 종합 판정
 

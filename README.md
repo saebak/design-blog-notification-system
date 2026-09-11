@@ -8,6 +8,19 @@
 - **핵심 설계 챌린지**: Low Latency 팬아웃, Write/Read Path 분리를 통한 고가용성, 순간 대량 트래픽(10만 QPS+)을 견디는 확장성.
 - 상세 요구사항은 [`docs/requirements.md`](./docs/requirements.md) 참고.
 
+현재는 Outbox/Read Model, 2단계 Fan-out, Push 영속 재시도·claim lease, Prometheus 지표와 수동 복구 API까지 구현돼 있다. 정확한 발행 시점 구독 스냅샷, 인증/RBAC, Email 실제 발송, 알림 목록·WebSocket/SSE는 문서화된 확장 범위다.
+
+### 10만 명 팬아웃 성능 최적화 결과 (2026-09-11)
+
+첫 10만 명 실측에서 Dispatcher의 exact membership gate가 원본 구독을 비효율적으로 스캔해 291.0~669.6초를 소비했다. 원인은 구독자 집합 비교에 필요한 인덱스 순서가 `(author_id, user_id)`인데 기존 인덱스는 백필 커서용 `(author_id, id)` 또는 역순인 `(user_id, author_id)`였기 때문이다.
+
+- `subscriptions(author_id, user_id) WHERE status = 'ACTIVE'` 부분 인덱스를 추가해 특정 작가의 활성 구독자만 순서대로 읽도록 했다.
+- 두 번의 상관 `NOT EXISTS`를 한 번의 `FULL OUTER JOIN` 기반 대칭 차집합 검사로 바꿨다. 단순 count 비교가 아니므로 **건수는 같지만 구성원이 다른 경우도 계속 차단**한다.
+- `EXPLAIN (ANALYZE, BUFFERS)`에서 원본 구독과 Read Model 양쪽 모두 `Index Only Scan`을 사용했고, 10만 명 exact-set 검사는 약 **655초 → 341ms(약 1,920배)**로 줄었다.
+- 동일 로컬 환경의 재실행에서 Dispatcher 완료는 **291.0~669.6초 → 6.97초(약 41.8~96.1배)**, 전체 알림/Push 작업 행 생성은 **390.7~761.6초 → 186.1초(약 2.1~4.1배)**, 처리량은 **131.3~255.9 → 537.3 msg/sec**로 개선됐다.
+
+정확성은 100개 청크, Notification/Push 작업 각 100,000건, 재시도 0건으로 통과했다. 다만 목표인 5초/20,000 msg/sec에는 아직 미달한다. membership 조회 병목이 제거된 뒤에는 Chunk Worker가 수신자마다 Notification과 delivery row를 개별 INSERT하는 최소 20만 번의 DB 왕복이 지배적인 병목이다. 다음 최적화 우선순위는 이 경로를 JDBC batch 또는 set-based bulk INSERT로 전환하는 것이다. 상세 측정 조건과 한계는 [`부하 테스트 실행 결과`](./docs/test/load-test-report.md)에 기록했다.
+
 ## 기술 스택
 
 | 영역 | 기술 | 비고 |
@@ -58,6 +71,11 @@ docker compose up -d
 | `POST` | `/api/posts/{id}/publish` | 글 발행 (→ Outbox → Fan-out → 알림 생성 트리거) |
 | `PATCH` | `/api/notifications/{id}/read?recipientId=` | 알림 개별 읽음 처리 |
 | `PATCH` | `/api/users/{recipientId}/notifications/read-all` | 알림 전체 읽음 처리 |
+| `POST` | `/api/internal/notification-recovery/fanout/{eventId}` | FAILED Fan-out 수동 재처리(내부 운영용) |
+| `POST` | `/api/internal/notification-recovery/delivery/{deliveryId}` | DEAD_LETTER Push 수동 재처리(내부 운영용) |
+| `GET` | `/actuator/prometheus` | Prometheus 운영 지표 |
+
+`notification-channel=EMAIL` 설정은 저장되지만 Email 발송기는 아직 확장 범위다. 인증 구현 전까지 내부 복구 API와 Actuator는 외부에 직접 노출하지 않는다.
 
 ## 설계 문서
 
@@ -65,10 +83,11 @@ docker compose up -d
 - [도메인 설계](./docs/domain-design.md) — Post / Subscription / Notification Bounded Context 및 Context Map
 - [데이터베이스 설계](./docs/database-design.md) — Context별 DDL 및 인덱스 전략
 - [아키텍처 설계](./docs/architecture.md) — 메시지 브로커/2단계 Fan-out/Delivery 파이프라인/실시간 채널
-- [부하 테스트 시나리오 설계](./docs/test/load-test-plan.md) / [실행 결과](./docs/test/load-test-report.md) — NFR-1/NFR-3 검증 (로컬 리소스 제약으로 축소 규모 실행, 사유는 결과 문서 §0)
-- [장애 주입(Chaos) 테스트 시나리오 설계](./docs/test/chaos-test-plan.md) / [실행 결과](./docs/test/chaos-test-report.md) — NFR-2 검증, Read Model 동기화 레이스가 실제 알림 유실로 이어지는 것을 실측
+- [부하 테스트 시나리오 설계](./docs/test/load-test-plan.md) / [실행 결과](./docs/test/load-test-report.md) — membership 최적화 후 10만 명 재측정에서 186.1초·537.3 msg/sec로 개선됐지만 5초 SLA는 아직 실패
+- [장애 주입(Chaos) 테스트 시나리오 설계](./docs/test/chaos-test-plan.md) / [실행 결과](./docs/test/chaos-test-report.md) — 과거 장애 기준선과 최신 Kafka/재시도/claim 복구 자동 검증
 - [구현 트레이드오프와 남은 결정사항](./docs/decisions.md) — 구현하며 스코프를 좁힌 지점과 아직 결정하지 않고 미뤄둔 사항들, 각각 다시 논의할 시점(트리거)
 - [트러블슈팅 기록](./docs/troubleshooting.md) — 개발/테스트 과정에서 겪은 구체적 문제와 진단·해결 과정 (환경 이슈, flaky 테스트, 장애 주입으로 발견한 실제 버그, 비동기 전환 중 만든 회귀 등)
+- [운영 가이드](./docs/operations.md) — Prometheus 지표·경보, FAILED/DEAD_LETTER 수동 복구, 확장 구현 백로그
 
 ## 프로젝트 구조
 
@@ -106,7 +125,7 @@ docker compose up -d
     │   │   └── dto/
     │   ├── notification/     # Notification Bounded Context (Fan-out/Delivery)
     │   │   ├── domain/       # Notification
-    │   │   ├── consumer/     # SubscriberSyncConsumer, PostPublishedFanoutConsumer (+ 각 이벤트의 로컬 DTO)
+    │   │   ├── consumer/     # SubscriberSyncConsumer, FanoutDispatcher, FanoutChunkWorker
     │   │   ├── gateway/      # PushGatewayPort, SimulatedPushGatewayAdapter (목업)
     │   │   ├── delivery/     # PushDeliveryWorker — delivery_log 폴링 재시도/DLQ
     │   │   ├── controller/ / service/ / repository/     # 레이어

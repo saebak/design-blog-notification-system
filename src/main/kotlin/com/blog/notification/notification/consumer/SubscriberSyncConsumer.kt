@@ -15,7 +15,7 @@ import tools.jackson.databind.ObjectMapper
 // 같은 (authorId, userId)에 대한 ACTIVE→CANCELLED 같은 연쇄가 뒤바뀌지 않게 한다. concurrency는
 // subscription.changed 파티션 수(6, KafkaTopicConfig)만큼 병렬 소비 — authorId 파티션 키 덕분에
 // 같은 (authorId, userId) 쌍은 항상 같은 파티션에 들어와 순서가 깨지지 않는다(architecture.md §3).
-// groupId를 PostPublishedFanoutConsumer와 분리한다(docs/decisions.md §5-b) — 같은 그룹을
+// groupId를 FanoutDispatcher와 분리한다(docs/decisions.md §5-b) — 같은 그룹을
 // 공유한 채로 concurrency를 6으로 올리면, 서로 다른 구독(subscription.changed vs post.published)을
 // 가진 멤버들이 한 그룹 안에서 계속 리밸런싱을 반복해 subscription.changed 쪽에 파티션이
 // 아예 할당되지 않는 문제를 실제로 겪었다.

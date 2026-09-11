@@ -2,9 +2,22 @@
 
 > 시나리오 설계는 [`chaos-test-plan.md`](./chaos-test-plan.md) 참고. 이 문서는 **실제 실행 결과**를 기록한다.
 
+> **기준선 주의(2026-09-10)**: §0 이후의 수동 결과는 단일 Fan-out Consumer와 영속 재시도/분산 발송 claim 도입 전 기록이다. 현재 구조의 핵심 복구 특성은 바로 아래 자동 통합 테스트로 재검증했으며, 실제 프로세스 강제 종료와 10만 명 성능은 별도 검증 대상이다.
+
+## 2026-09-10 최신 자동 복구 검증
+
+- `KafkaOutageRecoveryIntegrationTest`: Kafka pause 중 글 발행과 `PENDING` Outbox 적재를 확인하고, 복구 후 Outbox `PUBLISHED` 전환과 최종 알림 생성을 확인했다.
+- `DeliveryClaimIntegrationTest`: 동시 claim은 한 건만 성공하고, lease 만료 후 새 워커가 회수하면 이전 token의 완료 갱신이 거부되는 것을 확인했다.
+- `FanoutChunkBoundaryIntegrationTest`: 저장된 cursor/chunk index 이후 재개, 1,001명 청크 경계, 중복 이벤트 멱등성을 확인했다.
+- `NotificationRecoveryIntegrationTest`: FAILED Fan-out과 DEAD_LETTER Push 발송의 수동 재처리 및 운영 gauge를 확인했다.
+
+이 검증은 복구 정확성을 다룬다. 10만 명/5초 성능 SLA는 별도의 부하 테스트에서 측정한다.
+
+## 과거 기준선(2026-08)
+
 ## 0. 왜 원 계획과 다르게 실행했는가
 
-`chaos-test-plan.md`의 C1~C6은 청크 Dispatcher/Chunk Worker, Email 채널, Redis 기반 실시간 채널 등 실제로는 구현하지 않은 컴포넌트를 전제로 한다(`docs/decisions.md` 참고). 또한 이 시스템은 별도로 배포된 여러 워커 프로세스가 아니라 **단일 Spring Boot 프로세스**(Outbox Relay, Fan-out 컨슈머, Push 발송 워커가 전부 같은 JVM 안에서 스케줄러/컨슈머로 동작) 구조라, "알림 워커만 따로 죽인다"는 원 시나리오의 전제 자체가 성립하지 않는다. 그래서 이번 실행은 실제 구조에 맞게 시나리오를 재설계했다.
+2026-08 당시 `chaos-test-plan.md`의 C1~C6은 청크 Dispatcher/Chunk Worker, Email 채널, Redis 기반 실시간 채널 등 구현하지 않은 컴포넌트를 전제로 했다. 또한 별도 워커 배포가 아닌 **단일 Spring Boot 프로세스**였으므로 "알림 워커만 따로 죽인다"는 전제가 성립하지 않아 당시 구조에 맞게 시나리오를 재설계했다. Dispatcher/Chunk Worker는 이후 같은 JVM 내부 컴포넌트로 구현됐다.
 
 | 항목 | 값 |
 |---|---|

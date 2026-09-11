@@ -9,8 +9,13 @@ import org.springframework.stereotype.Component
 class SimulatedPushGatewayAdapter : PushGatewayPort {
     private val log = LoggerFactory.getLogger(javaClass)
 
-    override fun send(recipientId: Long, title: String): Boolean {
-        log.info("외부 Push 서버로 발송 위임 (simulated): recipientId={}, title={}", recipientId, title)
+    override fun send(deliveryId: Long, recipientId: Long, title: String): Boolean {
+        log.info(
+            "외부 Push 서버로 발송 위임 (simulated): deliveryId={}, recipientId={}, title={}",
+            deliveryId,
+            recipientId,
+            title,
+        )
         return true
     }
 }

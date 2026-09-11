@@ -1,0 +1,31 @@
+groups:
+  - name: notification-pipeline
+    rules:
+      - alert: NotificationFanoutFailed
+        expr: notification_fanout_dispatches{status="failed"} > 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: Fan-out dispatch requires manual recovery
+          description: One or more fan-out dispatches exhausted automatic retries.
+      - alert: NotificationFanoutRetryBacklog
+        expr: notification_fanout_dispatches{status="waiting_retry"} > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: Fan-out retry backlog is not draining
+          description: Fan-out dispatches have remained in WAITING_RETRY for at least five minutes.
+      - alert: NotificationPushDeadLetter
+        expr: notification_delivery_attempts{channel="push",status="dead_letter"} > 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: Push deliveries reached DEAD_LETTER
+          description: Inspect the gateway error and requeue affected deliveries after remediation.
+      - alert: NotificationPushBacklog
+        expr: notification_delivery_attempts{channel="push",status="pending"} > 1000
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: Push delivery backlog is growing
+          description: More than 1,000 push deliveries have remained pending for five minutes.

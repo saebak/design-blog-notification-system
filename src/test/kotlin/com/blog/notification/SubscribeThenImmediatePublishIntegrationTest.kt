@@ -15,7 +15,7 @@ import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate
 
 // docs/decisions.md §2 — subscriber_read_model 동기화와 Fan-out은 서로 다른 비동기 파이프라인이라
 // 순서를 보장하지 않는다. 이 테스트는 그 gap을 일부러 피하지 않고 "구독 직후 즉시 발행"을 그대로
-// 재현해, PostPublishedFanoutConsumer의 재시도(findSubscribersWithRetry)가 이 흔한 케이스를
+// 재현해, FanoutDispatcher의 영속 지연 재시도가 이 흔한 케이스를
 // 흡수하는지 검증한다 — PostPublishedFanoutIntegrationTest는 반대로 이 레이스를 피해서 만든
 // 안정적인 happy-path 테스트이니 혼동하지 말 것.
 @Import(TestcontainersConfiguration::class)
@@ -51,7 +51,7 @@ class SubscribeThenImmediatePublishIntegrationTest {
     }
 
     private fun awaitNotificationRecipients(postId: Long, expectedCount: Int): List<Long> {
-        // 컨슈머 자체의 재시도 예산(findSubscribersWithRetry, 약 4초)보다 넉넉하게 잡는다 —
+        // Dispatcher의 영속 지연 재시도와 테스트 환경의 Kafka 리밸런싱보다 넉넉하게 잡는다 —
         // 전체 스위트를 함께 돌릴 때는 다른 테스트 클래스가 같은 Kafka consumer group을 방금
         // 막 떠난 직후라 리밸런싱 오버헤드가 추가로 끼어들 수 있다(테스트 인프라 특유의 잡음이지
         // 프로덕션 재시도 로직의 결함이 아니다).

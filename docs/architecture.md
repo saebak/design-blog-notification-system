@@ -1,6 +1,8 @@
 # 아키텍처 설계 — 메시지 브로커 / DB / Fan-out
 
-> [`domain-design.md`](./domain-design.md)에서 정한 Bounded Context 경계와 이벤트 계약(`PostPublished`, `SubscriptionChanged`)을 실제로 어떤 인프라 구성 요소로 구현할지 정한다. 각 결정마다 "왜 이렇게 했는가"를 함께 남긴다 — 특히 NFR-1(5초 이내 10만 팬아웃), NFR-2(장애 격리), NFR-3(핫 파티션/수평 확장)을 기준으로 트레이드오프를 판단한다.
+> [`domain-design.md`](./domain-design.md)에서 정한 Bounded Context 경계와 이벤트 계약(`PostPublished`, `SubscriptionChanged`)을 실제 인프라 구성 요소로 구현하는 방법을 정리한다.
+
+> **현행 기준(2026-09-10)**: Outbox Relay, Subscriber Read Model, 1,000명 키셋 `FanoutDispatcher`, 32파티션 `fanout.chunk.requested`, 동시성 6의 `FanoutChunkWorker`, DB 폴링 Push Worker, 영속 재시도/claim lease, Prometheus 지표와 수동 복구 API까지 구현돼 있다. 아래 다이어그램의 Email 발송·WebSocket/SSE·JWT 인증은 **확장 설계**이며 현재 런타임 경로가 아니다. 최신 운영 방법과 정확한 지표명은 [`operations.md`](./operations.md)를 기준으로 한다.
 
 ## 0. 이 문서에서 풀어야 하는 핵심 문제
 
@@ -12,7 +14,7 @@
 
 ---
 
-## 1. 전체 아키텍처
+## 1. 전체 목표 아키텍처와 현재 구현 범위
 
 ```mermaid
 flowchart TB
@@ -81,6 +83,8 @@ flowchart TB
     EMAILW -. "재시도 초과" .-> DLQ2
 ```
 
+현재 구현 경로는 `Post/Subscription Outbox → Kafka → Subscriber Sync/Fanout Dispatcher → fanout.chunk.requested → Chunk Worker → PostgreSQL Notification/Delivery Log → DB Polling Push Worker`다. 다이어그램의 `delivery.*` 토픽, Email Worker, WebSocket/SSE는 확장 범위다.
+
 - Post/Subscription 모듈은 **자신의 이벤트를 발행할 뿐, Notification의 존재를 모른다** (`domain-design.md` §2와 동일한 원칙) — DB가 물리적으로 한 인스턴스 안에 있다는 사실과 무관하게, 코드에서는 서로의 스키마를 참조하지 않는다.
 - 모든 DB 노드는 **하나의 PostgreSQL 인스턴스** 안에 스키마로만 분리돼 있다(`database-design.md` §0). Fan-out이 `users`를 조회하는 화살표(`CHUNK → USERS`)가 예외처럼 보일 수 있지만, 같은 인스턴스 내 쿼리라 네트워크를 타는 서비스 간 호출이 아니다 — `domain-design.md` §2/§6 참고.
 - `fanout.chunk.requested`가 이 설계의 핵심 추가 요소다 — 아래 §4에서 자세히 설명한다.
@@ -92,13 +96,13 @@ flowchart TB
 | 구성 요소 | 선택 | 근거 |
 |---|---|---|
 | Language/Runtime | **Kotlin** (JVM) | 코루틴 기반 비동기 처리로 Kafka 컨슈머/청크 워커의 동시성 코드를 Java보다 간결하게 표현할 수 있고, JVM 생태계(Kafka/PostgreSQL/Redis 클라이언트 성숙도)를 그대로 활용할 수 있어 이 아키텍처와 궁합이 좋다. |
-| Backend Framework | **Spring Boot** (Spring Kafka, Spring Data JDBC, Spring WebFlux/STOMP) | Kafka 컨슈머 그룹, 트랜잭셔널 아웃박스(Outbox Relay), WebSocket을 각각 별도 라이브러리 조합 없이 1급 지원. |
+| Backend Framework | **Spring Boot** (Spring Kafka, Spring Data JDBC, Spring MVC, Actuator) | Kafka 컨슈머 그룹, 트랜잭셔널 아웃박스, REST API, Prometheus 지표를 구성한다. WebSocket은 확장 범위다. |
 | DB 배포 토폴로지 | 단일 PostgreSQL 인스턴스, Context별 스키마로 논리 분리 | Bounded Context 분리(코드 경계)와 물리 배포는 별개 문제. 인스턴스를 여러 개 운영하는 인프라 복잡도는 불필요하다고 판단, 모듈러 모놀리식으로 시작(`database-design.md` §0). 대신 DB 인스턴스 자체가 공동 장애점(SPOF)이 된다는 트레이드오프는 수용한다(§8 NFR-2 참고). |
 | 메시지 브로커 | Kafka | 파티션 기반 컨슈머 그룹으로 수평 확장이 쉽고(NFR-3.2), 처리량 목표(20k msg/sec)에 맞는 처리량/내구성 검증된 선택지. 재시도용 DLQ 토픽 구성도 자연스럽다. |
 | Outbox Relay | DB 폴링 또는 CDC(Debezium) | NFR-2.2 — 브로커 장애 시에도 글 등록 트랜잭션은 커밋되어야 하므로, 이벤트 발행을 트랜잭션 밖의 별도 프로세스로 완전히 분리. |
-| Notification 저장소 | RDB(쓰기 정합성) + 읽기 캐시(Redis, unread count) | 알림 생성은 멱등성 unique 제약(`domain-design.md` §5.2)이 필요해 RDB가 유리하고, unread count 같은 고빈도 조회는 캐시로 분리해 Read Path를 발송 파이프라인과 격리(NFR-2.3). |
-| 실시간 채널 | WebSocket + Redis Pub/Sub(다중 인스턴스 브로드캐스트) | Notification 서버가 여러 인스턴스로 수평 확장될 것이므로, 특정 사용자가 어느 인스턴스에 연결돼 있는지 모른 채로도 이벤트를 전파해야 함. |
-| Push/Email 게이트웨이 | 목업 인터페이스(Port) | FR-4.1/4.2, 요구사항 범위상 실연동은 Out of Scope. |
+| Notification 저장소 | PostgreSQL | 알림 멱등성 unique 제약과 읽음 처리 정합성을 보장한다. Redis 기반 조회 캐시는 확장 범위다. |
+| 실시간 채널 | 확장 범위 | 현재는 WebSocket/SSE와 Redis Pub/Sub을 사용하지 않는다. |
+| Push 게이트웨이 | `PushGatewayPort` + simulated adapter | 외부 FCM/APNs 실연동은 범위 밖이다. Email 게이트웨이는 확장 범위다. |
 | Infra/Deploy | Docker Compose (Kafka, PostgreSQL, Redis, 앱 다중 인스턴스를 로컬에서 함께 구동) | 지금 스코프에서는 단일 머신에서 전체 파이프라인을 재현 가능한 것이 우선이고, k8s 수준의 오케스트레이션은 이 프로젝트의 검증 목표(NFR 충족 여부)에 필수적이지 않다고 판단. 여유가 되면 k8s manifest를 확장 예시로 추가한다. |
 | Load Test | k6 | JS 기반 스크립팅으로 HTTP API(구독, 글 등록)와 WebSocket 시나리오를 함께 작성하기 Locust보다 간결하고, Grafana 연동이 쉬워 NFR-1.4(부하 테스트 결과 문서화)와 §4.4의 관측 지표를 같은 대시보드에서 볼 수 있다. |
 
@@ -169,20 +173,20 @@ sequenceDiagram
 - Chunk Worker: `Notification`의 `(recipientId, sourceEventId)` unique 제약(`domain-design.md` §5.2)이 최종 방어선 — 위 재개 로직이 완벽하지 않아 일부 구간이 중복 발행돼도, 청크가 중복 소비되면 insert 시 conflict로 걸러진다(멱등 upsert 또는 `ON CONFLICT DO NOTHING`).
 - 즉 **at-least-once 전달 + DB unique 제약 기반 dedup**으로 NFR-4.2를 만족시킨다. Exactly-once를 브로커 레벨에서 보장하려 하지 않는다 — 그 편이 훨씬 단순하고, 성능에도 유리하다.
 
-### 4.4 진행률 추적 (메트릭 기반)
+### 4.4 진행 상태와 운영 메트릭
 
-`domain-design.md` §5.4에서 언급한 진행 상태 추적은 DB 테이블이 아니라 **메트릭**으로 구현한다.
+현재는 `notification.fanout_dispatches`에 event ID별 cursor, 다음 chunk index, 재시도 횟수와 상태를 저장해 재시작 후 이어서 처리한다. Prometheus에는 `notification_fanout_dispatches{status}`, `notification_fanout_chunks_dispatched_total`, `notification_fanout_chunks_completed_total`, deferred/failed counter를 노출한다. 고 cardinality 방지를 위해 event ID/author ID는 메트릭 라벨로 사용하지 않고, 특정 이벤트 조사는 DB 실행 저널과 구조화 로그로 추적한다. 정확한 지표명과 경보는 [`operations.md`](./operations.md)를 기준으로 한다.
+- "5초 SLA를 지켰는가"는 테스트에서 특정 `event_id`의 발행 시각부터 `fanout_dispatches.status = DONE` 및 기대 알림 행 수 도달 시점까지 계산한다. 전역 Prometheus counter는 처리 추세와 이상 징후 감시에 사용한다.
 
-- Dispatcher가 청크를 발행할 때마다 `fanout_chunks_dispatched_total{eventId, authorId}` 카운터 증가, 동시에 `fanout_total_count{eventId}` 게이지로 이번 팬아웃의 전체 대상자 수를 기록.
-- Chunk Worker가 청크 처리를 완료할 때마다 `fanout_chunks_completed_total{eventId}` 카운터 증가, `fanout_chunk_duration_seconds` 히스토그램으로 청크당 처리 시간 기록.
-- `eventId`를 공통 라벨(또는 분산 트레이싱 ID)로 붙여, Dispatcher와 여러 Chunk Worker에 흩어진 메트릭/로그를 하나의 팬아웃 작업으로 상관관계 지어 조회할 수 있게 한다.
-- "5초 SLA를 지켰는가"는 `dispatched_total`과 `completed_total`이 같아지는 시점 - `started_at` 타임스탬프(트레이스 시작 시각)로 사후 계산하거나, Grafana 알림 룰로 실시간 모니터링한다.
-
-**DB 테이블(`FanoutProgress`)로 만들지 않은 이유**: 팬아웃 1건당 최대 100개 Chunk Worker가 진행률 행 하나를 동시에 원자적으로 갱신해야 하는데, 이는 곧 **쓰기 경합(hot row)**을 의미한다. NFR-1(5초 내 처리)을 지키기 위한 관측 장치가 오히려 그 SLA를 깎아먹는 역설이 생길 수 있어, 진행률 추적은 워커별로 독립적으로 emit 가능한 메트릭 시스템(Prometheus 등)에 맡기고 DB에는 상태를 두지 않는다.
+**저장 범위 결정**: DB에는 Dispatcher 한 곳만 갱신하는 cursor/상태/재시도 작업 저널을 둔다. 여러 Chunk Worker가 공유하는 `completed_count` 같은 진행률 hot row는 두지 않으며, 청크 처리 총량은 독립 counter로 관측한다.
 
 ---
 
-## 5. Delivery 파이프라인 (Push/Email)
+## 5. Delivery 파이프라인
+
+**현재 구현**: Chunk Worker는 Push 대상에 대해 `notification_delivery_log`를 만들고, `PushDeliveryWorker`가 DB를 `FOR UPDATE SKIP LOCKED`로 claim한다. `PROCESSING` claim에는 token과 30초 lease가 있어 다중 인스턴스 중복 발송을 막고, 만료 claim은 회수된다. 최대 3회 실패하면 `DEAD_LETTER`가 되며 내부 복구 API로 다시 `PENDING` 처리할 수 있다. Email 사용자는 알림 row만 생성되고 실제 Email 발송은 하지 않는다.
+
+아래 채널별 Kafka 토픽·Email Worker·토큰 버킷은 **확장 설계**다.
 
 - Chunk Worker는 `DeliveryAttempt`를 만든 후, 채널별로 **별도 토픽**(`delivery.push.requested`, `delivery.email.requested`)에 발행한다.
 - **파티션 키: 랜덤(또는 `notificationId`)** — `authorId`나 `userId`로 파티셔닝하지 않는다. 인기 작가 팬아웃 시 특정 파티션에 메시지가 몰리는 핫 파티션을 피하기 위해, 발송 요청은 순서를 보장할 필요가 없으므로 넓게 분산시키는 것이 유리하다.
@@ -192,7 +196,7 @@ sequenceDiagram
 
 ---
 
-## 6. 실시간 알림 (WebSocket/SSE)
+## 6. 실시간 알림 (WebSocket/SSE, 확장 설계)
 
 - Chunk Worker가 `Notification`을 생성하는 시점에, 해당 사용자가 현재 접속 중이면 즉시 push한다(FR-5.4). 접속 여부/소켓 위치는 Notification 서버 인스턴스가 여러 대이므로 Redis Pub/Sub으로 브로드캐스트해 "어느 인스턴스가 그 사용자의 소켓을 들고 있든" 전달되게 한다.
 - **5초 SLA(NFR-1.1) 크리티컬 패스에는 포함되지 않는다**: SLA는 "레코드 생성 + 발송 큐 적재"까지만 기준으로 삼는다(NFR-1.2). WS/Redis Pub/Sub 발행은 `Notification` bulk insert 이후 fire-and-forget으로 트리거되고, 그 결과(전달 성공/실패, 지연)를 기다리지 않는다 — Push/Email 게이트웨이 전달과 마찬가지로 Best-effort 비동기로 취급한다.
@@ -207,8 +211,8 @@ sequenceDiagram
 | `post.published` | `authorId` | 낮음(예: 6) | 저빈도 이벤트. 같은 작가의 연속 발행 순서 보장. 팬아웃 병렬성은 이 토픽이 아니라 §4의 청크 토픽이 담당. |
 | `subscription.changed` | `authorId` | 낮음(예: 6) | 같은 작가에 대한 구독/해지 순서 보장 (§3). |
 | `fanout.chunk.requested` | 랜덤/round-robin | 높음(예: 32) | 청크 단위 작업을 여러 워커에 최대한 넓게 분산 — 핫 파티션 회피의 실질적 해법(§4.1). |
-| `delivery.push.requested` / `delivery.email.requested` | 랜덤/`notificationId` | 높음(예: 32) | 발송 요청은 순서 무관, 인기 작가발 대량 요청을 고르게 분산(§5). |
-| `*.dlq` | 원본과 동일 | 낮음 | 실패 건은 재처리 순서보다 완전성이 중요, 저빈도. |
+| `delivery.push.requested` / `delivery.email.requested` (확장) | 랜덤/`notificationId` | 높음(예: 32) | 채널별 Kafka 발송으로 확장할 때의 목표 설계(§5). |
+| `*.dlq` (확장) | 원본과 동일 | 낮음 | 채널별 Kafka 발송으로 확장할 때의 목표 설계. 현재 Push DLQ는 DB 상태다. |
 
 **공통 원칙**: 순서 보장이 필요한 곳(작가 단위 이벤트)만 의미 있는 키로 파티셔닝하고, 순서가 필요 없고 물량이 몰리는 곳(청크/발송 요청)은 일부러 키를 흩어 핫 파티션을 피한다. NFR-3.3을 "인기 작가 = 특정 파티션 과부하"로 좁게 해석하지 않고, **애초에 인기 작가의 대량 작업이 특정 파티션에 몰리지 않도록 파생 토픽의 키 자체를 설계**하는 방식으로 대응한다.
 
@@ -218,9 +222,9 @@ sequenceDiagram
 
 | NFR | 대응 설계 |
 |---|---|
-| NFR-1 (5초/20k msg/sec) | 2단계 Fan-out(§4), 청크 크기 산정(§4.2), 채널별 토픽 분리(§5) |
-| NFR-2 (가용성/장애 격리) | Outbox+Relay(글 등록 트랜잭션과 이벤트 발행 분리), Read Path(unread count 캐시)와 발송 파이프라인 저장소 분리, 채널별 토픽 분리로 장애 격리. **범위 캐벗**: 이 격리는 애플리케이션 프로세스 레벨(NFR-2.1이 명시한 "팬아웃 워커, 발송기, 큐")까지다 — DB는 Post/Subscription/Notification이 하나의 인스턴스를 공유하므로 DB 자체 장애는 공동 장애점(SPOF)이며, 이는 요구사항이 요구하는 격리 범위 밖이라 수용한다(§2 DB 배포 토폴로지 참고). |
-| NFR-3 (확장성/핫 파티션) | Stateless Consumer Group 기반 워커, 청크/발송 토픽의 분산 파티션 키(§7), 백프레셔(§5) |
+| NFR-1 (5초/20k msg/sec) | 2단계 Fan-out, 1,000명 청크와 동시성 6. membership 인덱스/쿼리 최적화 후 10만 명 실측은 186.1초·537.3 msg/sec로 개선됐지만 SLA 실패. 다음 병목은 개별 INSERT |
+| NFR-2 (가용성/장애 격리) | Outbox+Relay, 영속 Fan-out retry, Push claim lease. DB는 Context들이 공유하는 공동 장애점이며 수용 범위다 |
+| NFR-3 (확장성/핫 파티션) | Stateless Consumer Group Chunk Worker, 32개 청크 파티션, DB `SKIP LOCKED` Push claim |
 | NFR-4 (관측성/멱등성/정합성/보안) | 팬아웃 진행률 메트릭(§4.4), unique 제약 기반 dedup(§4.3), 읽음 처리 동시성(§8.1), API 인가(§8.2) |
 
 ### 8.1 읽음 처리 동시성 (NFR-4.3)
@@ -232,8 +236,9 @@ sequenceDiagram
 
 같은 사용자가 여러 탭/기기에서 동시에 "모두 읽음"을 눌러도, DB의 행 잠금(row lock)이 두 UPDATE를 자연스럽게 직렬화하고 두 번째 실행은 대상 행이 이미 `is_read = true`라 갱신 대상이 0건이 된다 — 결과는 항상 같은 최종 상태로 수렴하므로 애플리케이션 레벨 락이나 낙관적 잠금(버전 컬럼)이 필요 없다. `idx_notifications_unread`(부분 인덱스, `database-design.md` §4.2)가 이 UPDATE의 `WHERE` 절도 그대로 커버한다.
 
-### 8.2 알림 API 인가 (NFR-4.4)
+### 8.2 알림 API 인가 (확장 설계)
 
+- 현재 인증/인가 계층은 구현하지 않았다. 아래는 향후 JWT 도입 시 적용할 설계다.
 - 인증: 모든 알림 API(목록 조회/읽음 처리/unread count)는 JWT를 요구하고, 미들웨어가 토큰의 `sub` 클레임에서 `recipientId`를 추출한다.
 - 인가: `recipientId`는 **항상 토큰에서 추출한 값만 사용**하고, URL 경로나 요청 바디에 담긴 사용자 ID는 신뢰하지 않는다 (IDOR 방지). 모든 조회/갱신 쿼리는 `WHERE recipient_id = :tokenRecipientId` 조건을 반드시 포함한다.
 - 서비스 레이어에서도 이 조건이 빠지지 않았는지 재확인하는 것을 코드 리뷰 체크리스트로 둔다 — Repository 메서드 시그니처 자체에 `recipientId`를 필수 인자로 강제해 "조건 누락"을 컴파일/타입 레벨에서 방지하는 것을 권장.
@@ -243,5 +248,6 @@ sequenceDiagram
 ## 9. 다음 단계
 
 - 각 DB 테이블의 실제 DDL/인덱스 전략 → [`database-design.md`](./database-design.md) (`Subscriber Read Model`은 `(authorId, userId)` 복합 인덱스로 청크 스캔 최적화)
-- 부하 테스트 시나리오 설계: [`docs/test/load-test-plan.md`](./test/load-test-plan.md) — §4.2의 청크 크기/워커 수 가정을 실측으로 검증, 실행 결과는 `docs/test/load-test-report.md`(추후)
-- 장애 주입 테스트 시나리오 설계: [`docs/test/chaos-test-plan.md`](./test/chaos-test-plan.md) — 팬아웃 워커 강제 종료 후 글 등록 API 정상 동작 확인, 브로커 장애 시 Outbox Relay 재시도 확인, 실행 결과는 `docs/test/chaos-test-report.md`(추후)
+- 부하 테스트: [`docs/test/load-test-plan.md`](./test/load-test-plan.md), [`docs/test/load-test-report.md`](./test/load-test-report.md) — membership 최적화 후 10만 명 재측정은 186.1초·537.3 msg/sec로 개선됐지만 5초 SLA는 실패했다.
+- 장애 복구 테스트: [`docs/test/chaos-test-plan.md`](./test/chaos-test-plan.md), [`docs/test/chaos-test-report.md`](./test/chaos-test-report.md) — Kafka pause, claim lease 만료, cursor 재개, 수동 복구 자동 검증을 반영했다.
+- 운영 지표·경보·수동 복구: [`operations.md`](./operations.md)

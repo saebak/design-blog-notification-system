@@ -4,6 +4,8 @@ import com.blog.notification.subscription.dto.SubscribeRequest
 import com.blog.notification.subscription.dto.SubscriptionResponse
 import com.blog.notification.subscription.service.SubscriptionService
 import jakarta.validation.Valid
+import jakarta.validation.constraints.Max
+import jakarta.validation.constraints.Min
 import org.springframework.http.HttpStatus
 import org.springframework.web.bind.annotation.DeleteMapping
 import org.springframework.web.bind.annotation.GetMapping
@@ -14,8 +16,10 @@ import org.springframework.web.bind.annotation.RequestMapping
 import org.springframework.web.bind.annotation.RequestParam
 import org.springframework.web.bind.annotation.ResponseStatus
 import org.springframework.web.bind.annotation.RestController
+import org.springframework.validation.annotation.Validated
 
 @RestController
+@Validated
 class SubscriptionController(
     private val subscriptionService: SubscriptionService,
 ) {
@@ -35,7 +39,7 @@ class SubscriptionController(
     fun listMySubscriptions(
         @PathVariable userId: Long,
         @RequestParam(required = false) cursor: Long?,
-        @RequestParam(defaultValue = "50") limit: Int,
+        @RequestParam(defaultValue = "50") @Min(1) @Max(100) limit: Int,
     ): List<SubscriptionResponse> =
         subscriptionService.listMySubscriptions(userId, cursor, limit).map(SubscriptionResponse::from)
 
@@ -44,7 +48,7 @@ class SubscriptionController(
     fun listSubscribers(
         @PathVariable authorId: Long,
         @RequestParam(required = false) cursor: Long?,
-        @RequestParam(defaultValue = "1000") limit: Int,
+        @RequestParam(defaultValue = "1000") @Min(1) @Max(1000) limit: Int,
     ): List<SubscriptionResponse> =
         subscriptionService.listSubscribers(authorId, cursor, limit).map(SubscriptionResponse::from)
 }

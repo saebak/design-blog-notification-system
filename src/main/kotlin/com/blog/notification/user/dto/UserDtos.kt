@@ -5,11 +5,12 @@ import com.blog.notification.user.User
 import jakarta.validation.constraints.Email
 import jakarta.validation.constraints.NotBlank
 import jakarta.validation.constraints.NotNull
+import jakarta.validation.constraints.Size
 import java.time.Instant
 
 data class CreateUserRequest(
-    @field:NotBlank @field:Email val email: String,
-    @field:NotBlank val name: String,
+    @field:NotBlank @field:Email @field:Size(max = 255) val email: String,
+    @field:NotBlank @field:Size(max = 100) val name: String,
     val notificationChannel: NotificationChannel = NotificationChannel.PUSH,
 )
 
