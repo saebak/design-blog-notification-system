@@ -72,7 +72,7 @@ docker compose up -d
 - [도메인 설계](./docs/domain-design.md) — Post / Subscription / Notification Bounded Context 및 Context Map
 - [데이터베이스 설계](./docs/database-design.md) — Context별 DDL 및 인덱스 전략
 - [아키텍처 설계](./docs/architecture.md) — 메시지 브로커/2단계 Fan-out/Delivery 파이프라인/실시간 채널
-- [부하 테스트 시나리오 설계](./docs/test/load-test-plan.md) / [실행 결과](./docs/test/load-test-report.md) — 기존 결과는 과거 단일 Consumer 기준선이며 현행 구조의 10만 명/5초 재측정 필요
+- [부하 테스트 시나리오 설계](./docs/test/load-test-plan.md) / [실행 결과](./docs/test/load-test-report.md) — 현행 구조로 10만 명을 재측정해 정확성은 통과했지만 390.7~761.6초로 5초 SLA 실패
 - [장애 주입(Chaos) 테스트 시나리오 설계](./docs/test/chaos-test-plan.md) / [실행 결과](./docs/test/chaos-test-report.md) — 과거 장애 기준선과 최신 Kafka/재시도/claim 복구 자동 검증
 - [구현 트레이드오프와 남은 결정사항](./docs/decisions.md) — 구현하며 스코프를 좁힌 지점과 아직 결정하지 않고 미뤄둔 사항들, 각각 다시 논의할 시점(트리거)
 - [트러블슈팅 기록](./docs/troubleshooting.md) — 개발/테스트 과정에서 겪은 구체적 문제와 진단·해결 과정 (환경 이슈, flaky 테스트, 장애 주입으로 발견한 실제 버그, 비동기 전환 중 만든 회귀 등)

@@ -10,7 +10,7 @@
 | Outbox Relay, Subscriber Read Model, Dispatcher/Chunk Worker 팬아웃 | 구현 완료 |
 | Push 영속 재시도, 다중 워커 claim lease, Dead Letter | 구현 완료 |
 | Prometheus 지표, 경보 규칙, 수동 복구 API, 자동 장애 복구 테스트 | 구현 완료 |
-| 현행 구조의 10만 명/5초 성능 검증 | 재실행 필요(기존 보고서는 과거 구조의 기준선) |
+| 현행 구조의 10만 명/5초 성능 검증 | 재실행 완료 — 정확성 통과, 390.7~761.6초로 SLA 실패 |
 | 정확한 발행 시점 구독 스냅샷/워터마크 | 확장 구현(문서만 유지) |
 | 인증·RBAC, Email 발송, 알림 목록/실시간 WebSocket·SSE | 확장 구현(문서만 유지) |
 
@@ -98,7 +98,7 @@
 - 장애 주입 자동 테스트와 결과 문서화
 - Prometheus 운영 지표, 경보 규칙, 수동 복구 API
 - 기본 로깅 (구조화된 애플리케이션 로그 수준)
-- 부하 테스트 시나리오/스크립트(현행 구조 결과는 재실행 필요)
+- 부하 테스트 시나리오/스크립트와 현행 10만 명 실행 결과
 
 ### Out of Scope (목업/생략 대상, README에 명시)
 - 실제 FCM/APNs 연동 — 별도의 외부 Push 서버가 있다고 가정하고, 이 시스템은 그 서버로 발송을 위임(요청)하는 지점까지만 구현한다.
@@ -120,7 +120,7 @@
 | 6 | Push 위임 + 재시도/claim lease/Dead Letter | 완료 | FR-4.1, FR-4.3, FR-4.4 |
 | 7 | Prometheus 지표·경보·수동 복구 API | 완료 | NFR-4 |
 | 8 | 알림 읽음 처리 API(개별/전체) | 완료 | FR-5.2 |
-| 9 | 현행 구조 부하 테스트 재실행 | 대기 | NFR-1, NFR-3 |
+| 9 | 현행 구조 10만 명 부하 테스트 | 실행 완료·SLA 실패 | NFR-1, NFR-3 |
 | 10 | 장애 주입·복구 자동 테스트와 결과 문서 | 완료 | NFR-2 |
 | 11 | snapshot/auth/Email/제품 기능 | 확장 문서만 | FR-1.3, FR-3.4 |
 
@@ -129,6 +129,6 @@
 ## 5. 완료 기준 (Definition of Done)
 
 - 현재 구현 범위의 FR/NFR 항목은 코드 또는 테스트로 검증 가능해야 한다. 확장 항목은 문서에서 구현 범위와 분리한다.
-- [`load-test-report.md`](./test/load-test-report.md)는 과거 단일 Consumer 구조의 기준선이다. 현행 Dispatcher/Chunk Worker 구조의 10만 명/5초 검증 결과를 후속으로 기록해야 한다.
+- [`load-test-report.md`](./test/load-test-report.md)에 과거 기준선과 현행 Dispatcher/Chunk Worker 10만 명 재측정 결과를 구분해 기록했다. 정확성은 통과했지만 5초 성능 SLA는 실패했다.
 - 장애 주입 테스트 결과가 [`/docs/test/chaos-test-report.md`](./test/chaos-test-report.md)에 기록되어 있다. 시나리오 설계는 `/docs/test/chaos-test-plan.md` 참고.
 - 아키텍처 설계와 다이어그램은 [`architecture.md`](./architecture.md)에 정리한다.

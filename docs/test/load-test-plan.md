@@ -1,6 +1,6 @@
 # 부하 테스트 시나리오 설계
 
-> 실행 결과는 [`load-test-report.md`](./load-test-report.md)에 기록한다. 현재 보고서는 이전 단일 Fan-out Consumer 구현의 기준선이다. 현행 구조는 1,000명 키셋 청크, 32개 Kafka 파티션, Chunk Worker 동시성 6이며 이 구성으로 재측정해야 한다.
+> 실행 결과는 [`load-test-report.md`](./load-test-report.md)에 기록한다. 2026-09-11 현행 1,000명 키셋 청크, 32개 Kafka 파티션, Chunk Worker 동시성 6으로 10만 명 재측정을 완료했으며 정확성은 통과했지만 5초 SLA는 실패했다.
 
 ## 0. 목적 및 범위
 

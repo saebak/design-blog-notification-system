@@ -231,6 +231,7 @@ Fan-out은 `authorId`로 이 테이블을 청크 단위(FR-2.4)로 스캔한다.
 ## 8. 다음 단계
 
 - 현행 스키마와 파티션/동시성 설정은 [`architecture.md`](./architecture.md), [`database-design.md`](./database-design.md)를 기준으로 유지한다.
-- 우선순위 1: 현행 Dispatcher/Chunk Worker 구조로 10만 명/5초 부하 테스트를 다시 실행한다.
-- 우선순위 2: 운영 지표와 수동 복구 API를 실제 운영 환경의 인증·감사 체계에 연결한다.
+- 우선순위 1: 10만 명 실측에서 드러난 membership gate 인덱스/쿼리와 Chunk Worker 개별 INSERT를 최적화한다.
+- 우선순위 2: 최적화 후 동일 10만 명 테스트와 워커 확장 효율 측정을 반복한다.
+- 우선순위 3: 운영 지표와 수동 복구 API를 실제 운영 환경의 인증·감사 체계에 연결한다.
 - 확장 구현: 정확한 발행 시점 구독 스냅샷, 인증/RBAC, Email, WebSocket/SSE.

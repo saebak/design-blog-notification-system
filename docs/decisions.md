@@ -8,11 +8,12 @@
 - `fanout_dispatches`에 커서, 다음 청크 번호, 재시도 시각과 횟수를 저장한다. Read Model이 비어 있으면 메모리 안에서 잠깐 재시도하고 포기하지 않고 `WAITING_RETRY`로 남겨 스케줄러가 복구한다. 최대 재시도 후에는 `FAILED`로 남아 운영자가 식별할 수 있다.
 - 같은 글의 동시 발행은 `DRAFT -> PUBLISHED` 조건부 갱신으로 단 한 요청만 승리하므로 `PostPublished` Outbox 이벤트가 중복 생성되지 않는다.
 - Push 발송 로그는 `PROCESSING` 상태, claim token, lease를 이용해 여러 인스턴스가 같은 건을 동시에 발송하지 않도록 claim한다. 만료된 claim은 다른 워커가 회수할 수 있다.
-- 초기 Read Model 백필은 opt-in 배치로 구현돼 있다. 이 문서 아래의 과거 기록과 부하/장애 보고서는 의사결정 이력 및 이전 구현 기준선으로 보존하며, 최신 구조의 성능 수치는 재측정 전이다.
+- 초기 Read Model 백필은 opt-in 배치로 구현돼 있다. 이 문서 아래의 과거 기록은 의사결정 이력 및 이전 구현 기준선으로 보존한다. 최신 구조의 성능 수치는 `test/load-test-report.md`의 2026-09-11 결과를 따른다.
 - Read Model 준비 조건 보완: Dispatcher는 첫 청크를 발행하기 전에 원본 ACTIVE 구독 집합과 Read Model 집합이 양방향으로 일치하는지 확인한다. 비어 있거나 일부만 반영된 경우 모두 영속 재시도로 넘기며, 진짜 구독자 0명인 경우에는 정상 완료한다. 다만 스캔이 시작된 뒤 새로 발생하는 구독/취소는 장기 스냅샷으로 고정하지 않고 기존 eventual-consistency 의미를 따른다.
 - **확장 구현으로 보류**: 발행 시점의 정확한 snapshot/watermark, 인증·인가, Email 채널, 사용자용 기능은 현재 안정성 작업과 분리해 `operations.md`의 백로그로 관리한다.
+- **2026-09-11 성능 검증**: 현행 10만 명 실행은 중복·누락 없이 완료됐지만 390.7~761.6초가 걸려 5초 SLA에 실패했다. 첫 청크 전 membership gate와 Chunk Worker의 수신자별 개별 INSERT가 우선 최적화 대상이다(`test/load-test-report.md`).
 
-> **현재 상태 갱신(2026-09-09)**: 아래의 2026-08 기록은 의사결정 이력으로 보존한다. 이후 `FanoutDispatcher`가 구독자를 1,000명씩 키셋 조회해 `fanout.chunk.requested`로 분산하고, `FanoutChunkWorker`가 처리하는 구조를 구현했다. Dispatcher 진행 상태와 지수 백오프 재시도는 DB에 영속화되며 재시작 후에도 이어진다. Push 발송은 lease/token 기반 `FOR UPDATE SKIP LOCKED` 클레임으로 다중 인스턴스 중복 처리를 막았다. 글 발행도 `DRAFT → PUBLISHED` 조건부 갱신으로 동시 요청에서 Outbox 이벤트가 한 번만 생성된다. 다만 Read Model이 **일부만** 반영된 순간의 완전한 스냅샷 일관성은 아직 보장하지 않으며, 최신 구조의 부하/장애 수치는 재측정 전이다.
+> **현재 상태 갱신(2026-09-11)**: 아래의 2026-08 기록은 의사결정 이력으로 보존한다. 이후 `FanoutDispatcher`가 구독자를 1,000명씩 키셋 조회해 `fanout.chunk.requested`로 분산하고, `FanoutChunkWorker`가 처리하는 구조를 구현했다. Dispatcher 진행 상태와 지수 백오프 재시도는 DB에 영속화되며 재시작 후에도 이어진다. Push 발송은 lease/token 기반 `FOR UPDATE SKIP LOCKED` 클레임으로 다중 인스턴스 중복 처리를 막았다. 글 발행도 `DRAFT → PUBLISHED` 조건부 갱신으로 동시 요청에서 Outbox 이벤트가 한 번만 생성된다. Read Model membership gate는 시작 전 동기화 누락을 방어하지만 스캔 중 변경까지 고정하는 snapshot은 확장 범위다. 현행 10만 명 성능은 정확성 통과·5초 SLA 실패로 측정됐다.
 
 ## 1. [과거 결정 기록] Fan-out을 청크로 분산하지 않고 단일 컨슈머가 전체 처리
 

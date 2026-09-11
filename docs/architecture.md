@@ -222,7 +222,7 @@ sequenceDiagram
 
 | NFR | 대응 설계 |
 |---|---|
-| NFR-1 (5초/20k msg/sec) | 2단계 Fan-out(§4), 1,000명 청크와 동시성 6. 목표 달성 여부는 현행 부하 테스트 재실행 필요 |
+| NFR-1 (5초/20k msg/sec) | 2단계 Fan-out, 1,000명 청크와 동시성 6. 2026-09-11 현행 실측은 390.7~761.6초로 SLA 실패. membership gate와 개별 INSERT 최적화 필요 |
 | NFR-2 (가용성/장애 격리) | Outbox+Relay, 영속 Fan-out retry, Push claim lease. DB는 Context들이 공유하는 공동 장애점이며 수용 범위다 |
 | NFR-3 (확장성/핫 파티션) | Stateless Consumer Group Chunk Worker, 32개 청크 파티션, DB `SKIP LOCKED` Push claim |
 | NFR-4 (관측성/멱등성/정합성/보안) | 팬아웃 진행률 메트릭(§4.4), unique 제약 기반 dedup(§4.3), 읽음 처리 동시성(§8.1), API 인가(§8.2) |
@@ -248,6 +248,6 @@ sequenceDiagram
 ## 9. 다음 단계
 
 - 각 DB 테이블의 실제 DDL/인덱스 전략 → [`database-design.md`](./database-design.md) (`Subscriber Read Model`은 `(authorId, userId)` 복합 인덱스로 청크 스캔 최적화)
-- 부하 테스트: [`docs/test/load-test-plan.md`](./test/load-test-plan.md), [`docs/test/load-test-report.md`](./test/load-test-report.md) — 기존 결과는 단일 Consumer 기준선이므로 최신 청크 구조로 재측정한다.
+- 부하 테스트: [`docs/test/load-test-plan.md`](./test/load-test-plan.md), [`docs/test/load-test-report.md`](./test/load-test-report.md) — 현행 10만 명 재측정에서 정확성은 통과했지만 5초 SLA는 실패했다.
 - 장애 복구 테스트: [`docs/test/chaos-test-plan.md`](./test/chaos-test-plan.md), [`docs/test/chaos-test-report.md`](./test/chaos-test-report.md) — Kafka pause, claim lease 만료, cursor 재개, 수동 복구 자동 검증을 반영했다.
 - 운영 지표·경보·수동 복구: [`operations.md`](./operations.md)
